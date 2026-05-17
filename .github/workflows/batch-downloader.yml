@@ -108,6 +108,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install phub[full]
+          pip install av
 
       - name: Download videos via API
         id: download
@@ -155,7 +156,8 @@ jobs:
           print(f"Downloading: {video.title}")
           video.download(
               path="tmpvideos/",
-              quality=quality
+              quality=quality,
+              remux=True
               # all advanced options (max_workers_download, etc.) are left at their defaults
           )
 
