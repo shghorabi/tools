@@ -104,52 +104,85 @@ jobs:
             # exit 1  <-- Uncomment this if you want the pipeline to FAIL when WARP fails
           fi
 
-      - name: Setup yt-dlp
+      - name: Setup package
         run: |
-          sudo apt-get install -y python3-pip curl
-          pip install yt-dlp --pre
+          pip install --upgrade pip
+          pip install phub[full]
 
-          # install deno
-          curl -fsSL https://deno.land/install.sh | sh
-          export DENO_INSTALL="$HOME/.deno"
-          export PATH="$DENO_INSTALL/bin:$PATH"
-          echo "$DENO_INSTALL/bin" >> $GITHUB_PATH
-          deno --version
-
-      - name: Download videos
+      - name: Download videos via API
         id: download
         run: |
-          # quality
-          QUALITY="${{ inputs.quality }}"
-          if [ "$QUALITY" = "audio" ]; then
-              FORMAT_OPTS="-f ba -x --audio-format mp3"
-          elif [ "$QUALITY" = "best" ]; then
-              FORMAT_OPTS="--merge-output-format mp4"
-          else
-              FORMAT_OPTS="-f bv*[height<=${QUALITY}]+ba/b[height<=${QUALITY}] --merge-output-format mp4"
-          fi
-          
-          # output
-          OUTPUT_NAME="${{ inputs.output_name }}"
-          if [ -n "$OUTPUT_NAME" ]; then
-              OUTPUT_OPTS="-o ${OUTPUT_NAME}.%(ext)s"
-          fi
-          
-          # download
           mkdir -p tmpvideos
-          cd tmpvideos
-          
-          yt-dlp --remote-components ejs:github --proxy "socks5://127.0.0.1:1080" --sub-langs all --embed-subs -i $FORMAT_OPTS $OUTPUT_OPTS "${{ inputs.url }}"
 
-          # find name
+          python3 << 'PYEOF'
+          # ---------- imports ----------
+          from phub import Client                 
+          from base_api.modules.config import config
+          from base_api.base import BaseCore
+
+          # ---------- optional proxy (if you keep WARP) ----------
+          # If you DO NOT need the WARP proxy, remove or comment out this whole block,
+          # and later just use: client = Client()
+          use_proxy = True   # set to False if you don't want the proxy
+          if use_proxy:
+              config.proxy = "socks5://127.0.0.1:1080"
+              # you can set other config options here if needed, e.g.:
+              # config.request_delay = 5
+
+              # create a custom core with the proxy config
+              core = BaseCore(config=config)
+              # optional extra features (logging, kill‑switch) – not required
+              # core.enable_logging()
+              # core.enable_kill_switch()
+
+              client = Client(core=core)
+          else:
+              # plain client (no custom proxy)
+              client = Client()
+          # ----------------------------------------
+
+          # ---------- fetch video ----------
+          url = "${{ inputs.url }}"
+          video = client.get(url)
+          video.refresh()   # refresh metadata (title, available streams)
+
+          # ---------- quality handling ----------
+          quality = "${{ inputs.quality }}"
+          if quality == "audio":
+              # download best video, then extract audio with ffmpeg
+              quality = "best"
+
+          print(f"Downloading: {video.title}")
+          video.download(
+              path="tmpvideos/",
+              quality=quality
+              # all advanced options (max_workers_download, etc.) are left at their defaults
+          )
+
+          # ---------- audio extraction if requested ----------
+          if "${{ inputs.quality }}" == "audio":
+              import subprocess, os
+              files = os.listdir("tmpvideos")
+              if files:
+                  input_file = os.path.join("tmpvideos", files[0])
+                  output_file = os.path.join("tmpvideos", os.path.splitext(files[0])[0] + ".mp3")
+                  subprocess.run([
+                      "ffmpeg", "-i", input_file, "-vn",
+                      "-acodec", "libmp3lame", "-q:a", "2",
+                      output_file
+                  ], check=True)
+                  os.remove(input_file)
+          PYEOF
+
+          # ===== everything below is exactly as before =====
+          cd tmpvideos
           FILE=$(ls -1 | head -n 1)
           FILE_NO_EXTENSION="${FILE%.*}"
           echo "FILE=$FILE" >> $GITHUB_ENV
           echo "FILE_NO_EXTENSION=$FILE_NO_EXTENSION" >> $GITHUB_ENV
           SAFE_NAME=$(echo "$FILE_NO_EXTENSION" | sed 's/^[[:space:]]*//' | tr ' ' '_')
           echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
-          
-          # zip and overwrite
+
           mkdir -p ../videos
           rm -rf tmpzip
           mkdir tmpzip
