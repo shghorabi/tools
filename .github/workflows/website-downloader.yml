@@ -135,39 +135,43 @@ jobs:
           mkdir -p archive_data
           chmod 777 archive_data
 
-          PROXY_ARGS=""
-          if [ ${{ inputs.use_warp }} == 'true' ]; then
+          # --- Define proxy arguments as an array (safe for spaces) ---
+          PROXY_ARGS=()
+          if [ "${{ inputs.use_warp }}" == 'true' ]; then
             echo "Using WARP proxy..."
-            PROXY_ARGS="--network warp-net -e HTTP_PROXY=socks5h://warp:1080 -e HTTPS_PROXY=socks5h://warp:1080"
+            PROXY_ARGS=(
+              --network warp-net
+              -e HTTP_PROXY=socks5h://warp:1080
+              -e HTTPS_PROXY=socks5h://warp:1080
+            )
           fi
-          
-          # --- USER AGENT OVERRIDES to avoid bot detection ---
-          # These tell ArchiveBox’s fetchers to look like a normal Chrome/Firefox browser
-          AGENT_ARGS=" \
-            -e CHROME_USER_AGENT='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
-            -e WGET_USER_AGENT='Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0' \
-            -e CURL_USER_AGENT='Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' \
-          "
-          
-          # initialize ArchiveBox (pass proxies + user agents)
-          docker run --rm $PROXY_ARGS $AGENT_ARGS -v $PWD/archive_data:/data archivebox/archivebox init --setup
-          
-          # add and archive the CLEANED URL (from the sanitize step)
-          docker run --rm $PROXY_ARGS $AGENT_ARGS -v $PWD/archive_data:/data archivebox/archivebox add "${{ env.SANITIZED_URL }}"
-          
+
+          # --- USER AGENT OVERRIDES (safe array form) ---
+          AGENT_ARGS=(
+            -e "CHROME_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            -e "WGET_USER_AGENT=Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0"
+            -e "CURL_USER_AGENT=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+          )
+
+          # initialize ArchiveBox (properly expand arrays)
+          docker run --rm "${PROXY_ARGS[@]}" "${AGENT_ARGS[@]}" -v "$PWD/archive_data:/data" archivebox/archivebox init --setup
+
+          # add and archive the CLEANED URL
+          docker run --rm "${PROXY_ARGS[@]}" "${AGENT_ARGS[@]}" -v "$PWD/archive_data:/data" archivebox/archivebox add "${{ env.SANITIZED_URL }}"
+
           # move to the branch folder
           mkdir -p web
           cd web
-          
+
           OUTPUT_NAME="${{ inputs.output_name }}"
-          
+
           # zip
           rm -rf tmpzip
           mkdir tmpzip
           zip -0 -r -s "${{ inputs.parts_size }}m" "tmpzip/${OUTPUT_NAME}.zip" ../archive_data
           mv tmpzip/* ./
           rm -rf tmpzip
-          
+
           echo "FILE_NAME=$OUTPUT_NAME" >> $GITHUB_ENV
 
       - name: Stop WARP
