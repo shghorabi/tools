@@ -260,10 +260,9 @@ jobs:
           print(user.bio)
           print(user.info)
           for video in uploads:
+              print("1")
               print(video.title)
               print(video.url)
-          print(uploads)
-          print(videos)
           PYEOF
 
       - name: Generate README with links to results
