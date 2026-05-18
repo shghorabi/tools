@@ -1,4 +1,4 @@
-name: Video Downloader
+name: Video Downloader 2
 
 on:
   workflow_dispatch:
