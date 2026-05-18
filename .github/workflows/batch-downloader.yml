@@ -3,6 +3,11 @@ name: Video Downloader
 on:
   workflow_dispatch:
     inputs:
+      quarry:
+        description: ' search quarry'
+        required: false
+        default: ''
+        type: string
       url:
         description: '🔗 Video video URL'
         required: true
@@ -143,6 +148,11 @@ jobs:
           # ----------------------------------------
 
           # ---------- fetch video ----------
+          search = client.search(query="${{ inputs.quarry }}",
+                        sort='views'
+                       )
+          for video in search:
+            print(video.title)
           url = "${{ inputs.url }}"
           video = client.get(url)
           video.refresh()   # refresh metadata (title, available streams)
