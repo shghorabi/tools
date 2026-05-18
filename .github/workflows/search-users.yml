@@ -252,6 +252,15 @@ jobs:
               json.dump(all_results, f, indent=2, ensure_ascii=False)
 
           print("Saved user_search_results.txt and user_search_results.json")
+          client = Client()
+          user = client.get_user("https://www.pornhub.com/model/realtelarilove")
+          uploads = user.uploads # Uploaded videos
+          videos = user.videos # Videos the user is featured in 
+          print(user.name)
+          for video in uploads:
+              print(video.title)
+              print(video.url)
+          
           PYEOF
 
       - name: Generate README with links to results
