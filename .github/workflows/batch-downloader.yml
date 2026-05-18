@@ -175,7 +175,7 @@ jobs:
 
                   outfile.write(f"\nTotal successful: {successful_count}\n")
               
-              print(f"Saved {len(successful_results)} search results to search_results.json")
+              print(f"Saved {successful_count} search results to search_results.txt")
           else:
               print("No search query provided, skipping search collection.")
               
