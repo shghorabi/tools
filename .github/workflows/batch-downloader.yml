@@ -122,6 +122,9 @@ jobs:
 
           python3 << 'PYEOF'
           # ---------- imports ----------
+          import json
+          import subprocess
+          import os
           from phub import Client                 
           from base_api.modules.config import config
           from base_api.base import BaseCore
@@ -146,17 +149,38 @@ jobs:
               # plain client (no custom proxy)
               client = Client()
           # ----------------------------------------
+          
+          # ---------- 1. Collect search results (up to 50) ----------
+          search_query = "${{ inputs.quarry }}"
+          if search_query.strip():   # only if quarry is provided
+              search = client.search(query=search_query, sort='views')
+              successful_results = []
 
+              for video in search:
+                  if len(successful_results) >= 50:
+                      break
+                  try:
+                      # Keep only essential fields to keep file small
+                      simplified = {
+                          'title': data.get('title'),
+                          'url': data.get('url'),
+                          'views': data.get('views'),
+                          'duration': str(data.get('duration')) if data.get('duration') else None,
+                          'author': str(data.get('author')) if data.get('author') else None
+                      }
+                      successful_results.append(simplified)
+                  except Exception as e:
+                      print(f"Skipping {video.url}: {e}")
+                      continue
+
+              # Save results to a JSON file
+              with open('search_results.json', 'w', encoding='utf-8') as f:
+                  json.dump(successful_results, f, indent=2, ensure_ascii=False)
+              print(f"Saved {len(successful_results)} search results to search_results.json")
+          else:
+              print("No search query provided, skipping search collection.")
+              
           # ---------- fetch video ----------
-          search = client.search(query="${{ inputs.quarry }}",
-                        sort='views'
-                       )
-          for video in search:
-              try:
-                  info = video.dictify('all')
-                  print(info)   # prints a dict with all fields that could be retrieved
-              except Exception as e:
-                   print(f"Skipping video {video.url}: {e}")
           url = "${{ inputs.url }}"
           video = client.get(url)
           video.refresh()   # refresh metadata (title, available streams)
@@ -209,25 +233,48 @@ jobs:
         run: |
           docker stop warp || true
 
-      - name: Generate README with Download Links
+      - name: Generate README with Download Links and Search Results
         run: |
           rm -f README.md
-          
+    
           echo "# 📥 Download Links" > README.md
           echo "Generated on: $(date)" >> README.md
           echo "" >> README.md
-          
-          # loop through all files in the videos folder
+    
+          # ---- Download links for the video parts ----
+          echo "## 🎬 Downloaded Video" >> README.md
           for file in videos/*; do
             if [ -f "$file" ]; then
               filename=$(basename "$file")
-              # URL Encode spaces for the markdown link
               encoded_filename=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$filename")
-              # Construct the raw link
               url="https://github.com/${{ github.repository }}/raw/${{ inputs.branch_name }}/videos/$encoded_filename"
               echo "- [Download $filename]($url)" >> README.md
             fi
           done
+          echo "" >> README.md
+    
+          # ---- Search results (if any) ----
+          if [ -f search_results.json ]; then
+            echo "## 🔍 Top 50 Search Results for \"${{ inputs.quarry }}\"" >> README.md
+            echo "" >> README.md
+            echo "| # | Title | Views | Author | URL |" >> README.md
+            echo "|---|-------|-------|--------|-----|" >> README.md
+      
+            # Use python to format JSON into markdown table
+            python3 << 'PYTABLE'
+            import json
+            with open('search_results.json', 'r', encoding='utf-8') as f:
+                results = json.load(f)
+            for idx, video in enumerate(results, 1):
+                title = video.get('title', 'N/A')
+                views = video.get('views', 'N/A')
+                author = video.get('author', 'N/A')
+                url = video.get('url', '#')
+                # Escape pipe characters in title to avoid breaking markdown table
+                title_escaped = title.replace('|', '\\|')
+                print(f"| {idx} | {title_escaped} | {views} | {author} | [Link]({url}) |")
+            PYTABLE
+          fi
           
       - name: Commit and push in batches
         run: |
@@ -237,8 +284,8 @@ jobs:
           
           # Commit the README first (tiny file)
           if [ -f README.md ]; then
-            git add README.md
-            git commit -m "[bot] Update README for ${{ env.SAFE_NAME }}" || echo "Nothing to commit for README"
+            git add README.md search_results.json
+            git commit -m "[bot] Update README and search results" || echo "Nothing to commit"
             git push
           fi
           
