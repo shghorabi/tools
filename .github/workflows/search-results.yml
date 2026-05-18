@@ -1,0 +1,133 @@
+name: Search Results
+
+on:
+  workflow_dispatch:
+    inputs:
+      quarry:
+        description: 'Search query'
+        required: true
+        default: ''
+        type: string
+      branch_name:
+        description: 'Branch to store search results (separate from video branch)'
+        required: true
+        default: 'search-results'
+        type: string
+
+jobs:
+  search-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Prepare branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin ${{ inputs.branch_name }}; then
+            git checkout ${{ inputs.branch_name }}
+            git pull origin ${{ inputs.branch_name }}
+          else
+            git checkout --orphan ${{ inputs.branch_name }}
+            git rm -rf . || true
+            git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
+            git push --set-upstream origin ${{ inputs.branch_name }}
+          fi
+
+      - name: Setup Python
+        run: |
+          pip install --upgrade pip
+          pip install phub[full]
+
+      # Optional: If you need WARP proxy for phub, uncomment the following block.
+      # Otherwise, remove it or keep it commented.
+      - name: Setup WARP (optional)
+        run: |
+          docker rm -f warp 2>/dev/null || true
+          docker network create warp-net 2>/dev/null || true
+          docker run -d --name warp --restart=always --network warp-net -p 1080:1080 \
+            --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+          sleep 10
+          # optional: wait for warp to be ready
+
+      - name: Run search and generate result file
+        run: |
+          python3 << 'PYEOF'
+          import json
+          import os
+          from phub import Client
+          from base_api.modules.config import config
+          from base_api.base import BaseCore
+
+          # ===== optional proxy (uncomment if you enabled WARP above) =====
+          # config.proxy = "socks5://127.0.0.1:1080"
+          # core = BaseCore(config=config)
+          # client = Client(core=core)
+          # ===== otherwise, plain client: =====
+          client = Client()
+
+          query = "${{ inputs.quarry }}"
+          if not query.strip():
+              raise ValueError("No search query provided")
+
+          search = client.search(query=query, sort='views')
+          successful = []
+          limit = 50
+
+          for video in search:
+              if len(successful) >= limit:
+                  break
+              try:
+                  info = video.dictify('all')
+                  successful.append(info)
+              except Exception as e:
+                  print(f"Skipping {video.url}: {e}")
+                  continue
+
+          # Write results to a text file (each dict as its string representation)
+          with open('search_results.txt', 'w', encoding='utf-8') as f:
+              f.write(f"Search query: {query}\n")
+              f.write(f"Successful results: {len(successful)}\n\n")
+              for idx, video_data in enumerate(successful, 1):
+                  f.write(f"--- Result {idx} ---\n")
+                  f.write(str(video_data))
+                  f.write("\n\n" + "="*80 + "\n\n")
+
+          # Also write a JSON version (optional, but useful)
+          with open('search_results.json', 'w', encoding='utf-8') as f:
+              json.dump(successful, f, indent=2, ensure_ascii=False)
+
+          print(f"Saved {len(successful)} results to search_results.txt and search_results.json")
+          PYEOF
+
+      - name: Generate README with link to results
+        run: |
+          cat > README.md << 'EOF'
+          # 🔍 Search Results
+
+          | Item | Value |
+          |------|-------|
+          | **Query** | ${{ inputs.quarry }} |
+          | **Date** | $(date -u) |
+          | **Results file** | [Download search_results.txt](./search_results.txt) |
+          | **JSON version** | [Download search_results.json](./search_results.json) |
+
+          ## 📄 Preview of first result (if any)
+          ```text
+          $(head -n 50 search_results.txt)
+      - name: Commit and push
+        run: |
+          git add README.md search_results.txt search_results.json
+          git commit -m "[bot] Update search results for '${{ inputs.quarry }}'" || echo "No changes to commit"
+          git push 
