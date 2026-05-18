@@ -94,13 +94,17 @@ jobs:
 
           # Proxy setup (same as before)
           config.proxy = "socks5://127.0.0.1:1080"
+          print("1")
           core = BaseCore(config=config)
+          print("2")
           client = Client(core=core)
-
+          print("3")
           query = "${{ inputs.quarry }}"
+          print("4")
+          print(query)
           if not query.strip():
               raise ValueError("No search query provided")
-
+          print("5")
           print(f"Searching for: {query}")
           search = client.search(query=query, sort='views')
 
