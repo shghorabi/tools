@@ -263,6 +263,10 @@ jobs:
               print("1")
               print(video.title)
               print(video.url)
+          for video in videos:
+              print("1")
+              print(video.title)
+              print(video.url)    
           PYEOF
 
       - name: Generate README with links to results
