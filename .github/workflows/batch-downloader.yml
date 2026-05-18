@@ -154,28 +154,27 @@ jobs:
           search_query = "${{ inputs.quarry }}"
           if search_query.strip():   # only if quarry is provided
               search = client.search(query=search_query, sort='views')
-              successful_results = []
+              successful_count = 0
 
-              for video in search:
-                  if len(successful_results) >= 50:
-                      break
-                  try:
-                      # Keep only essential fields to keep file small
-                      simplified = {
-                          'title': data.get('title'),
-                          'url': data.get('url'),
-                          'views': data.get('views'),
-                          'duration': str(data.get('duration')) if data.get('duration') else None,
-                          'author': str(data.get('author')) if data.get('author') else None
-                      }
-                      successful_results.append(simplified)
-                  except Exception as e:
-                      print(f"Skipping {video.url}: {e}")
-                      continue
+              with open('search_results.txt', 'w', encoding='utf-8') as outfile:
+                  outfile.write(f"Search results for: {search_query}\n")
+                  outfile.write(f"Up to 50 successful videos\n\n")
 
-              # Save results to a JSON file
-              with open('search_results.json', 'w', encoding='utf-8') as f:
-                  json.dump(successful_results, f, indent=2, ensure_ascii=False)
+                  for video in search:
+                      if successful_count >= 50:
+                          break
+                      try:
+                          info = video.dictify('all')
+                          # Write the dict as a string (same as print would show)
+                          outfile.write(str(info))
+                          outfile.write("\n\n" + "="*80 + "\n\n")
+                          successful_count += 1
+                      except Exception as e:
+                          print(f"Skipping {video.url}: {e}")
+                          continue
+
+                  outfile.write(f"\nTotal successful: {successful_count}\n")
+              
               print(f"Saved {len(successful_results)} search results to search_results.json")
           else:
               print("No search query provided, skipping search collection.")
@@ -236,11 +235,11 @@ jobs:
       - name: Generate README with Download Links and Search Results
         run: |
           rm -f README.md
-    
+          
           echo "# 📥 Download Links" > README.md
           echo "Generated on: $(date)" >> README.md
           echo "" >> README.md
-    
+          
           # ---- Download links for the video parts ----
           echo "## 🎬 Downloaded Video" >> README.md
           for file in videos/*; do
@@ -252,28 +251,13 @@ jobs:
             fi
           done
           echo "" >> README.md
-    
-          # ---- Search results (if any) ----
-          if [ -f search_results.json ]; then
-            echo "## 🔍 Top 50 Search Results for \"${{ inputs.quarry }}\"" >> README.md
-            echo "" >> README.md
-            echo "| # | Title | Views | Author | URL |" >> README.md
-            echo "|---|-------|-------|--------|-----|" >> README.md
-      
-            # Use python to format JSON into markdown table
-            python3 << 'PYTABLE'
-            import json
-            with open('search_results.json', 'r', encoding='utf-8') as f:
-                results = json.load(f)
-            for idx, video in enumerate(results, 1):
-                title = video.get('title', 'N/A')
-                views = video.get('views', 'N/A')
-                author = video.get('author', 'N/A')
-                url = video.get('url', '#')
-                # Escape pipe characters in title to avoid breaking markdown table
-                title_escaped = title.replace('|', '\\|')
-                print(f"| {idx} | {title_escaped} | {views} | {author} | [Link]({url}) |")
-            PYTABLE
+          
+          # ---- Search results (raw output) ----
+          if [ -f search_results.txt ]; then
+            echo "## 🔍 Search Results for \"${{ inputs.quarry }}\"" >> README.md
+            echo '```' >> README.md
+            cat search_results.txt >> README.md
+            echo '```' >> README.md
           fi
           
       - name: Commit and push in batches
@@ -284,7 +268,7 @@ jobs:
           
           # Commit the README first (tiny file)
           if [ -f README.md ]; then
-            git add README.md search_results.json
+            git add README.md search_results.txt
             git commit -m "[bot] Update README and search results" || echo "Nothing to commit"
             git push
           fi
