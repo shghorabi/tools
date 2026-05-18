@@ -152,7 +152,7 @@ jobs:
                         sort='views'
                        )
           for video in search:
-            print(f"{video.title} - {video.url}")
+            print(video.title)
           url = "${{ inputs.url }}"
           video = client.get(url)
           video.refresh()   # refresh metadata (title, available streams)
