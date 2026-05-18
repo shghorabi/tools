@@ -3,11 +3,6 @@ name: Video Downloader
 on:
   workflow_dispatch:
     inputs:
-      quarry:
-        description: ' search quarry'
-        required: false
-        default: ''
-        type: string
       url:
         description: '🔗 Video video URL'
         required: true
@@ -122,9 +117,6 @@ jobs:
 
           python3 << 'PYEOF'
           # ---------- imports ----------
-          import json
-          import subprocess
-          import os
           from phub import Client                 
           from base_api.modules.config import config
           from base_api.base import BaseCore
@@ -149,36 +141,7 @@ jobs:
               # plain client (no custom proxy)
               client = Client()
           # ----------------------------------------
-          
-          # ---------- 1. Collect search results (up to 50) ----------
-          search_query = "${{ inputs.quarry }}"
-          if search_query.strip():   # only if quarry is provided
-              search = client.search(query=search_query, sort='views')
-              successful_count = 0
 
-              with open('search_results.txt', 'w', encoding='utf-8') as outfile:
-                  outfile.write(f"Search results for: {search_query}\n")
-                  outfile.write(f"Up to 50 successful videos\n\n")
-
-                  for video in search:
-                      if successful_count >= 50:
-                          break
-                      try:
-                          info = video.dictify('all')
-                          # Write the dict as a string (same as print would show)
-                          outfile.write(str(info))
-                          outfile.write("\n\n" + "="*80 + "\n\n")
-                          successful_count += 1
-                      except Exception as e:
-                          print(f"Skipping {video.url}: {e}")
-                          continue
-
-                  outfile.write(f"\nTotal successful: {successful_count}\n")
-              
-              print(f"Saved {successful_count} search results to search_results.txt")
-          else:
-              print("No search query provided, skipping search collection.")
-              
           # ---------- fetch video ----------
           url = "${{ inputs.url }}"
           video = client.get(url)
@@ -232,7 +195,7 @@ jobs:
         run: |
           docker stop warp || true
 
-      - name: Generate README with Download Links and Search Results
+      - name: Generate README with Download Links
         run: |
           rm -f README.md
           
@@ -240,25 +203,17 @@ jobs:
           echo "Generated on: $(date)" >> README.md
           echo "" >> README.md
           
-          # ---- Download links for the video parts ----
-          echo "## 🎬 Downloaded Video" >> README.md
+          # loop through all files in the videos folder
           for file in videos/*; do
             if [ -f "$file" ]; then
               filename=$(basename "$file")
+              # URL Encode spaces for the markdown link
               encoded_filename=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$filename")
+              # Construct the raw link
               url="https://github.com/${{ github.repository }}/raw/${{ inputs.branch_name }}/videos/$encoded_filename"
               echo "- [Download $filename]($url)" >> README.md
             fi
           done
-          echo "" >> README.md
-          
-          # ---- Search results (raw output) ----
-          if [ -f search_results.txt ]; then
-            echo "## 🔍 Search Results for \"${{ inputs.quarry }}\"" >> README.md
-            echo '```' >> README.md
-            cat search_results.txt >> README.md
-            echo '```' >> README.md
-          fi
           
       - name: Commit and push in batches
         run: |
@@ -268,8 +223,8 @@ jobs:
           
           # Commit the README first (tiny file)
           if [ -f README.md ]; then
-            git add README.md search_results.txt
-            git commit -m "[bot] Update README and search results" || echo "Nothing to commit"
+            git add README.md
+            git commit -m "[bot] Update README for ${{ env.SAFE_NAME }}" || echo "Nothing to commit for README"
             git push
           fi
           
