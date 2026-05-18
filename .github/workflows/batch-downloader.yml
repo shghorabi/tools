@@ -153,11 +153,6 @@ jobs:
                        )
           for video in search:
             print(vars(video))
-          for video in search:
-            print("--- Video object ---")
-            for k, v in vars(video).items():
-              print(f"{k}: {v}")
-            break
           url = "${{ inputs.url }}"
           video = client.get(url)
           video.refresh()   # refresh metadata (title, available streams)
