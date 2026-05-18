@@ -43,50 +43,86 @@ jobs:
             git push --set-upstream origin ${{ inputs.branch_name }}
           fi
 
-      - name: Setup Python
+      - name: Setup FFmpeg (not strictly needed but harmless)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      - name: Setup WARP proxy
+        run: |
+          docker rm -f warp 2>/dev/null || true
+          docker network create warp-net 2>/dev/null || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP proxy to be ready..."
+          WARP_READY=false
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 3 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP ready (attempt $i)"
+              WARP_READY=true
+              break
+            fi
+            sleep 3
+          done
+          if [ "$WARP_READY" = false ]; then
+            echo "WARP not ready, continuing anyway..."
+          fi
+
+      - name: Setup Python and phub
         run: |
           pip install --upgrade pip
           pip install phub[full]
+          pip install av   # optional but safe
 
       - name: Run search and generate result files
         run: |
           python3 << 'PYEOF'
           import json
-          import os
           from phub import Client
-          # Uncomment proxy block if you need WARP
-          # from base_api.modules.config import config
-          # from base_api.base import BaseCore
-          # config.proxy = "socks5://127.0.0.1:1080"
-          # core = BaseCore(config=config)
-          # client = Client(core=core)
+          from base_api.modules.config import config
+          from base_api.base import BaseCore
 
-          client = Client()
+          # Configure proxy via WARP (exactly as in your download workflow)
+          config.proxy = "socks5://127.0.0.1:1080"
+          core = BaseCore(config=config)
+          client = Client(core=core)
+
           query = "${{ inputs.quarry }}"
           if not query.strip():
               raise ValueError("No search query provided")
 
+          print(f"Searching for: {query}")
           search = client.search(query=query, sort='views')
+
           successful = []
-          limit = 30   # Reduced from 50 to avoid regex failures
+          limit = 50   # you can reduce if needed
 
-          try:
-              for video in search:
-                  if len(successful) >= limit:
-                      break
-                  try:
-                      info = video.dictify('all')
-                      successful.append(info)
-                  except Exception as e:
-                      # Skip individual video that fails to dictify
-                      print(f"Skipping video (error in dictify): {e}")
-                      continue
-          except Exception as e:
-              # This catches RegexError during iteration (page parsing)
-              print(f"Search iteration stopped early: {e}")
-              print(f"Collected {len(successful)} results before error.")
+          # Debug: try to get first few video URLs manually?
+          # But the simple loop you confirmed works:
+          for video in search:
+              if len(successful) >= limit:
+                  break
+              try:
+                  info = video.dictify('all')
+                  successful.append(info)
+                  print(f"Collected {len(successful)}: {video.url}")
+              except Exception as e:
+                  print(f"Skipping video {video.url}: {e}")
+                  continue
 
-          # Write results to text file (human-readable)
+          print(f"Total successful: {len(successful)}")
+
+          # Write results
           with open('search_results.txt', 'w', encoding='utf-8') as f:
               f.write(f"Search query: {query}\n")
               f.write(f"Successful results: {len(successful)}\n\n")
@@ -95,11 +131,9 @@ jobs:
                   f.write(str(video_data))
                   f.write("\n\n" + "="*80 + "\n\n")
 
-          # Also write JSON version for programmatic use
           with open('search_results.json', 'w', encoding='utf-8') as f:
               json.dump(successful, f, indent=2, ensure_ascii=False)
 
-          print(f"Saved {len(successful)} results to search_results.txt and search_results.json")
           PYEOF
 
       - name: Generate README with links to results
@@ -114,9 +148,9 @@ jobs:
           | **Results file** | [Download search_results.txt](./search_results.txt) |
           | **JSON version** | [Download search_results.json](./search_results.json) |
 
-          ## 📄 Preview (first 40 lines of text results)
+          ## 📄 Preview (first 50 lines of text results)
           \`\`\`
-          $(head -n 40 search_results.txt 2>/dev/null || echo "No results")
+          $(head -n 50 search_results.txt 2>/dev/null || echo "No results")
           \`\`\`
           EOF
 
@@ -125,3 +159,6 @@ jobs:
           git add README.md search_results.txt search_results.json
           git commit -m "[bot] Update search results for '${{ inputs.quarry }}'" || echo "No changes to commit"
           git push
+
+      - name: Stop WARP (cleanup)
+        run: docker stop warp || true
