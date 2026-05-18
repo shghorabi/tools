@@ -1,0 +1,280 @@
+name: Search Users
+
+on:
+  workflow_dispatch:
+    inputs:
+      username:
+        description: 'Username query (partial)'
+        required: false
+        default: ''
+        type: string
+      country:
+        description: 'Country (e.g., US, FR, DE)'
+        required: false
+        default: ''
+        type: string
+      min_age:
+        description: 'Minimum age (integer)'
+        required: false
+        default: ''
+        type: string
+      max_age:
+        description: 'Maximum age (integer)'
+        required: false
+        default: ''
+        type: string
+      gender:
+        description: 'Gender (male, female, other)'
+        required: false
+        default: ''
+        type: string
+      orientation:
+        description: 'Orientation (straight, gay, bisexual, etc.)'
+        required: false
+        default: ''
+        type: string
+      offers:
+        description: 'Offers (e.g., videos, chats, photos)'
+        required: false
+        default: ''
+        type: string
+      relation:
+        description: 'Relationship status (single, married, etc.)'
+        required: false
+        default: ''
+        type: string
+      sort:
+        description: 'Sort method (relevance, newest, oldest, most_viewed, most_followed)'
+        required: false
+        default: 'relevance'
+        type: string
+      is_online:
+        description: 'Filter online users only? (true/false)'
+        required: false
+        default: ''
+        type: string
+      is_model:
+        description: 'Filter model users only? (true/false)'
+        required: false
+        default: ''
+        type: string
+      is_staff:
+        description: 'Filter staff members only? (true/false)'
+        required: false
+        default: ''
+        type: string
+      has_avatar:
+        description: 'Only users with custom avatar? (true/false)'
+        required: false
+        default: ''
+        type: string
+      has_videos:
+        description: 'Only users who have posted videos? (true/false)'
+        required: false
+        default: ''
+        type: string
+      has_photos:
+        description: 'Only users who have posted photos? (true/false)'
+        required: false
+        default: ''
+        type: string
+      has_playlists:
+        description: 'Only users who have created playlists? (true/false)'
+        required: false
+        default: ''
+        type: string
+      branch_name:
+        description: 'Branch to store search results'
+        required: true
+        default: 'user-search-results'
+        type: string
+
+jobs:
+  search-and-publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Prepare branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin ${{ inputs.branch_name }}; then
+            git checkout ${{ inputs.branch_name }}
+            git pull origin ${{ inputs.branch_name }}
+          else
+            git checkout --orphan ${{ inputs.branch_name }}
+            git rm -rf . || true
+            git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
+            git push --set-upstream origin ${{ inputs.branch_name }}
+          fi
+
+      - name: Setup WARP proxy
+        run: |
+          docker rm -f warp 2>/dev/null || true
+          docker network create warp-net 2>/dev/null || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP proxy to be ready..."
+          WARP_READY=false
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 3 --socks5-hostname 127.0.0.1:1080 https://cloudflare.com/cdn-cgi/trace 2>/dev/null || true)
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP ready (attempt $i)"
+              WARP_READY=true
+              break
+            fi
+            sleep 3
+          done
+          if [ "$WARP_READY" = false ]; then
+            echo "WARP not ready, continuing anyway..."
+          fi
+
+      - name: Setup Python and phub
+        run: |
+          pip install --upgrade pip
+          pip install phub[full]
+
+      - name: Run user search and generate result files
+        run: |
+          python3 << 'PYEOF'
+          import json
+          from phub import Client
+          from base_api.modules.config import config
+          from base_api.base import BaseCore
+
+          # Proxy setup
+          config.proxy = "socks5://127.0.0.1:1080"
+          core = BaseCore(config=config)
+          client = Client(core=core)
+
+          # Helper to convert string 'true'/'false' to bool
+          def str_to_bool(val):
+              if isinstance(val, bool):
+                  return val
+              if val is None or val == '':
+                  return None
+              return val.lower() == 'true'
+
+          # Collect all inputs (skip empty strings)
+          filters = {
+              'username': "${{ inputs.username }}",
+              'country': "${{ inputs.country }}",
+              'min_age': int("${{ inputs.min_age }}") if "${{ inputs.min_age }}" else None,
+              'max_age': int("${{ inputs.max_age }}") if "${{ inputs.max_age }}" else None,
+              'gender': "${{ inputs.gender }}" or None,
+              'orientation': "${{ inputs.orientation }}" or None,
+              'offers': "${{ inputs.offers }}" or None,
+              'relation': "${{ inputs.relation }}" or None,
+              'sort': "${{ inputs.sort }}" or None,
+              'is_online': str_to_bool("${{ inputs.is_online }}"),
+              'is_model': str_to_bool("${{ inputs.is_model }}"),
+              'is_staff': str_to_bool("${{ inputs.is_staff }}"),
+              'has_avatar': str_to_bool("${{ inputs.has_avatar }}"),
+              'has_videos': str_to_bool("${{ inputs.has_videos }}"),
+              'has_photos': str_to_bool("${{ inputs.has_photos }}"),
+              'has_playlists': str_to_bool("${{ inputs.has_playlists }}"),
+          }
+          # Remove None values
+          filters = {k: v for k, v in filters.items() if v is not None and v != ''}
+
+          if not filters.get('username'):
+              print("No username filter provided. The search may return many results; consider adding at least a username.")
+              # But we continue anyway, as the API might allow empty query.
+
+          print(f"Searching users with filters: {filters}")
+          users = client.search_user(**filters)
+
+          full_results = []   # full dict from user.dictify('all')
+          partial_results = [] # fallback: name, url, type
+          limit = 50
+          partial_limit = 30   # extra spots for partials
+
+          for user in users:
+              if len(full_results) >= limit and len(partial_results) >= partial_limit:
+                  break
+
+              try:
+                  info = user.dictify('all')
+                  full_results.append(info)
+                  print(f"Full user {len(full_results)}: {user.name} ({user.url})")
+              except Exception as e:
+                  # dictify failed, try basic attributes
+                  try:
+                      partial_results.append({
+                          'name': user.name,
+                          'url': user.url,
+                          'type': getattr(user, 'type', None),
+                          'partial': True,
+                          'error': str(e)[:100]
+                      })
+                      print(f"Partial user {len(partial_results)}: {user.name} ({user.url})")
+                  except Exception as e2:
+                      print(f"Skipping user - cannot get name/url: {e2}")
+                  continue
+
+          all_results = full_results + partial_results
+          print(f"Total collected: {len(full_results)} full + {len(partial_results)} partial = {len(all_results)}")
+
+          # Write text file
+          with open('user_search_results.txt', 'w', encoding='utf-8') as f:
+              f.write(f"Search filters: {filters}\n")
+              f.write(f"Full results (dictify): {len(full_results)}\n")
+              f.write(f"Partial results (name+url only): {len(partial_results)}\n")
+              f.write(f"Total: {len(all_results)}\n\n")
+              for idx, user_data in enumerate(all_results, 1):
+                  f.write(f"--- Result {idx} ---\n")
+                  f.write(str(user_data))
+                  f.write("\n\n" + "="*80 + "\n\n")
+
+          # Write JSON
+          with open('user_search_results.json', 'w', encoding='utf-8') as f:
+              json.dump(all_results, f, indent=2, ensure_ascii=False)
+
+          print("Saved user_search_results.txt and user_search_results.json")
+          PYEOF
+
+      - name: Generate README with links to results
+        run: |
+          cat > README.md << EOF
+          # 👥 User Search Results
+
+          | Item | Value |
+          |------|-------|
+          | **Filters** | ${{ inputs.username }} (username), country=${{ inputs.country }}, etc. |
+          | **Date** | $(date -u) |
+          | **Results file** | [Download user_search_results.txt](./user_search_results.txt) |
+          | **JSON version** | [Download user_search_results.json](./user_search_results.json) |
+
+          ## 📄 Preview (first 50 lines)
+          \`\`\`
+          $(head -n 50 user_search_results.txt 2>/dev/null || echo "No results")
+          \`\`\`
+          EOF
+
+      - name: Commit and push
+        run: |
+          git add README.md user_search_results.txt user_search_results.json
+          git commit -m "[bot] Update user search results for '${{ inputs.username }}'" || echo "No changes to commit"
+          git push
+
+      - name: Stop WARP (cleanup)
+        run: docker stop warp || true
