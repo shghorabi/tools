@@ -257,10 +257,13 @@ jobs:
           uploads = user.uploads # Uploaded videos
           videos = user.videos # Videos the user is featured in 
           print(user.name)
+          print(user.bio)
+          print(user.info)
           for video in uploads:
               print(video.title)
               print(video.url)
-          
+          print(uploads)
+          print(videos)
           PYEOF
 
       - name: Generate README with links to results
