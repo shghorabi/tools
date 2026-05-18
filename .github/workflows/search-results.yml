@@ -92,7 +92,7 @@ jobs:
           from base_api.modules.config import config
           from base_api.base import BaseCore
 
-          # Configure proxy via WARP (exactly as in your download workflow)
+          # Proxy setup (same as before)
           config.proxy = "socks5://127.0.0.1:1080"
           core = BaseCore(config=config)
           client = Client(core=core)
@@ -104,36 +104,59 @@ jobs:
           print(f"Searching for: {query}")
           search = client.search(query=query, sort='views')
 
-          successful = []
-          limit = 50   # you can reduce if needed
+          full_results = []   # dict from dictify('all')
+          partial_results = [] # dict with only 'title', 'url'
 
-          # Debug: try to get first few video URLs manually?
-          # But the simple loop you confirmed works:
+          full_limit = 50
+          partial_limit = 30
+
           for video in search:
-              if len(successful) >= limit:
+              # Stop if we have enough of both types
+              if len(full_results) >= full_limit and len(partial_results) >= partial_limit:
                   break
+
+              # Try to get full dict first
               try:
                   info = video.dictify('all')
-                  successful.append(info)
-                  print(f"Collected {len(successful)}: {video.url}")
+                  full_results.append(info)
+                  print(f"Full result {len(full_results)}: {video.url}")
               except Exception as e:
-                  print(f"Skipping video {video.url}: {e}")
+                  # Full dictify failed – try to at least get title and url
+                  try:
+                      title = video.title
+                      url = video.url
+                      partial_results.append({
+                          'title': title,
+                          'url': url,
+                          'partial': True,
+                          'error': str(e)[:100]  # optional: include first 100 chars of error
+                      })
+                      print(f"Partial result {len(partial_results)} (title/url only): {url}")
+                  except Exception as e2:
+                      print(f"Skipping video (cannot get title/url either): {video.url if hasattr(video, 'url') else 'unknown'} - {e2}")
                   continue
 
-          print(f"Total successful: {len(successful)}")
+          print(f"Total collected: {len(full_results)} full + {len(partial_results)} partial = {len(full_results)+len(partial_results)}")
 
-          # Write results
+          # Combine results: full dicts first, then partials
+          all_results = full_results + partial_results
+
+          # Write to text file
           with open('search_results.txt', 'w', encoding='utf-8') as f:
               f.write(f"Search query: {query}\n")
-              f.write(f"Successful results: {len(successful)}\n\n")
-              for idx, video_data in enumerate(successful, 1):
+              f.write(f"Full results (dictify): {len(full_results)}\n")
+              f.write(f"Partial results (title+url only): {len(partial_results)}\n")
+              f.write(f"Total: {len(all_results)}\n\n")
+              for idx, video_data in enumerate(all_results, 1):
                   f.write(f"--- Result {idx} ---\n")
                   f.write(str(video_data))
                   f.write("\n\n" + "="*80 + "\n\n")
 
+          # Write JSON version
           with open('search_results.json', 'w', encoding='utf-8') as f:
-              json.dump(successful, f, indent=2, ensure_ascii=False)
+              json.dump(all_results, f, indent=2, ensure_ascii=False)
 
+          print("Saved search_results.txt and search_results.json")
           PYEOF
 
       - name: Generate README with links to results
