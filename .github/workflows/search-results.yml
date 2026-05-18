@@ -8,11 +8,6 @@ on:
         required: true
         default: ''
         type: string
-      sort:
-        description: 'sort by recent, views, rated, longuest'
-        required: false
-        default: 'views'
-        type: string
       branch_name:
         description: 'Branch to store search results'
         required: true
@@ -103,12 +98,11 @@ jobs:
           client = Client(core=core)
 
           query = "${{ inputs.quarry }}"
-          sortby = "${{ inputs.sort }}"
           if not query.strip():
               raise ValueError("No search query provided")
 
           print(f"Searching for: {query}")
-          search = client.search(query=query, sort=sortby)
+          search = client.search(query=query, sort='recent')
 
           full_results = []   # dict from dictify('all')
           partial_results = [] # dict with only 'title', 'url'
