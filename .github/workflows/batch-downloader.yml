@@ -152,7 +152,11 @@ jobs:
                         sort='views'
                        )
           for video in search:
-            print(video.author)
+              try:
+                  info = video.dictify('all')
+                  print(info)   # prints a dict with all fields that could be retrieved
+              except Exception as e:
+                   print(f"Skipping video {video.url}: {e}")
           url = "${{ inputs.url }}"
           video = client.get(url)
           video.refresh()   # refresh metadata (title, available streams)
