@@ -102,7 +102,7 @@ jobs:
               raise ValueError("No search query provided")
 
           print(f"Searching for: {query}")
-          search = client.search(query=query, sort='rated')
+          search = client.search(query=query, sort='views')
 
           full_results = []   # dict from dictify('all')
           partial_results = [] # dict with only 'title', 'url'
