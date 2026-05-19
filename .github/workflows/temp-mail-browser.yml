@@ -62,28 +62,7 @@ jobs:
             const context = await browser.newContext({ ignoreHTTPSErrors: true });
             const page = await context.newPage();
 
-            // ---- Intercept network requests to capture sid_token ----
-            let sidToken = null;
-            page.on('request', request => {
-              const url = request.url();
-              if (url.includes('/ajax.php') && url.includes('sid_token=')) {
-                const match = url.match(/sid_token=([^&]+)/);
-                if (match && !sidToken) {
-                  sidToken = match[1];
-                  console.log('🔑 Captured sid_token from network request');
-                }
-              }
-            });
-
             await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
-
-            // Wait a bit for the token to be captured (the page makes an initial API call)
-            await page.waitForTimeout(2000);
-
-            if (!sidToken) {
-              console.error('❌ Failed to capture sid_token from network traffic. Aborting.');
-              process.exit(1);
-            }
 
             // ---- Get the temporary email address ----
             let email = '';
@@ -100,115 +79,172 @@ jobs:
               const match = bodyText.match(/[\w.-]+@[\w.-]+\.\w+/);
               email = match ? match[0] : 'UNKNOWN';
             }
-
             console.log('==============================================');
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
             console.log('Waiting for THREE emails (ignoring the welcome email)...');
             console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
-            const start = Date.now();
-            let emailSaved = false;
+            // ---- Attempt token capture (optional, we'll fallback to UI) ----
+            let sidToken = null;
+            // Method: listen for network requests
+            page.on('request', request => {
+              const url = request.url();
+              if (url.includes('/ajax.php') && url.includes('sid_token=')) {
+                const match = url.match(/sid_token=([^&]+)/);
+                if (match && !sidToken) {
+                  sidToken = match[1];
+                  console.log('🔑 Captured sid_token from network');
+                }
+              }
+            });
+            // Also try scraping scripts after a short delay
+            await page.waitForTimeout(2000);
+            if (!sidToken) {
+              sidToken = await page.evaluate(() => {
+                const scripts = document.querySelectorAll('script');
+                for (let s of scripts) {
+                  const text = s.textContent || s.innerText || '';
+                  const m = text.match(/sid_token['"]?\s*[:=]\s*['"]([^'"]+)['"]/);
+                  if (m) return m[1];
+                }
+                return null;
+              });
+            }
+            // Last chance: search all HTML
+            if (!sidToken) {
+              const html = await page.content();
+              const m = html.match(/sid_token[=:]\s*['"]([^'"]+)['"]/);
+              if (m) sidToken = m[1];
+            }
 
+            if (sidToken) {
+              console.log('Using API-based polling with captured token...');
+              // ---- API POLLING (same as before) ----
+              const start = Date.now();
+              let saved = false;
+              while (!saved) {
+                const elapsed = (Date.now() - start) / 1000;
+                if (elapsed >= TIMEOUT_SECONDS) { console.log('Timeout'); break; }
+                try {
+                  const list = await page.evaluate(async (token) => {
+                    const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { credentials: 'include' });
+                    return resp.json();
+                  }, sidToken);
+                  const emails = list.list || [];
+                  console.log(`Checked at ${Math.round(elapsed)}s – ${emails.length} email(s)`);
+                  if (emails.length >= 3) {
+                    const third = emails[2];
+                    const full = await page.evaluate(async (token, mailId) => {
+                      const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}&id=${mailId}`, { credentials: 'include' });
+                      return resp.json();
+                    }, sidToken, third.mail_id);
+                    saveEmail(third, full);
+                    saved = true;
+                    break;
+                  }
+                } catch (e) {
+                  console.log(`API error: ${e.message}`);
+                }
+                await page.waitForTimeout(10000);
+              }
+              if (saved) {
+                await browser.close();
+                return;
+              }
+              console.log('API polling failed, falling back to UI clicking...');
+            } else {
+              console.log('No token captured, using UI-based clicking...');
+            }
+
+            // ---- UI FALLBACK: wait for rows, click third, verify subject ----
+            const start = Date.now();
             while (true) {
               const elapsed = (Date.now() - start) / 1000;
               if (elapsed >= TIMEOUT_SECONDS) {
-                console.log('❌ Timeout: fewer than 3 emails.');
-                const fs = require('fs');
-                fs.mkdirSync('inbox', { recursive: true });
-                fs.writeFileSync('inbox/timeout.txt', 'Timed out waiting for third email.', 'utf-8');
+                console.log('Timeout');
                 break;
               }
 
-              // Fetch email list using captured sid_token
-              let listResponse;
-              try {
-                listResponse = await page.evaluate(async (token) => {
-                  const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { mode: 'cors', credentials: 'include' });
-                  if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                  const text = await resp.text();
-                  try {
-                    return JSON.parse(text);
-                  } catch (e) {
-                    throw new Error('Invalid JSON: ' + text.substring(0, 200));
-                  }
-                }, sidToken);
-              } catch (err) {
-                console.log(`⚠️ API error: ${err.message}. Retrying...`);
-                await page.waitForTimeout(10000);
-                continue;
-              }
-
-              const emailList = listResponse.list || [];
-              const count = emailList.length;
-              console.log(`Checked at ${Math.round(elapsed)}s – ${count} email(s) found.`);
+              const rows = await page.$$('tr.mail_row');
+              const count = rows.length;
+              console.log(`UI check at ${Math.round(elapsed)}s – ${count} email(s)`);
 
               if (count >= 3) {
-                console.log('✅ Three emails received! Fetching the third one...');
-                const thirdEmail = emailList[2]; // index 2 = third email
+                // Get subject of the third row (index 2) to verify later
+                const thirdSubject = await rows[2].$eval('.td3', el => el.textContent.trim()).catch(() => '');
+                console.log(`Third email subject: "${thirdSubject}"`);
 
-                // Fetch full email
-                let fullEmail;
+                // Click the third row
+                await rows[2].click();
+
+                // Wait for the email body to change to something containing this subject
+                // (or just wait for the body to update and then verify)
                 try {
-                  fullEmail = await page.evaluate(async (token, mailId) => {
-                    const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}&id=${mailId}`, { mode: 'cors', credentials: 'include' });
-                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
-                    const text = await resp.text();
-                    try {
-                      return JSON.parse(text);
-                    } catch (e) {
-                      throw new Error('Invalid JSON: ' + text.substring(0, 200));
-                    }
-                  }, sidToken, thirdEmail.mail_id);
-                } catch (err) {
-                  console.error(`Failed to fetch email content: ${err.message}`);
-                  break;
+                  await page.waitForFunction(
+                    (expectedSubject) => {
+                      const body = document.querySelector('.email_body');
+                      if (!body) return false;
+                      // Check if the body text or HTML contains the subject
+                      return body.innerText.includes(expectedSubject) || body.innerHTML.includes(expectedSubject);
+                    },
+                    thirdSubject,
+                    { timeout: 15000 }
+                  );
+                } catch (e) {
+                  console.log('Timed out waiting for body to match subject, continuing anyway...');
                 }
 
-                const mailFrom = thirdEmail.mail_from || 'unknown';
-                const mailSubject = thirdEmail.mail_subject || '(no subject)';
-                const bodyHTML = fullEmail.mail_html || '';
-                const bodyText = fullEmail.mail_body || '';
+                // Now extract the email body
+                const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
+                const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => thirdSubject);
+                const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
+                const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
 
-                // Extract all links from HTML body
-                const linkRegex = /href="([^"]+)"/g;
-                const allLinks = [];
-                let match;
-                while ((match = linkRegex.exec(bodyHTML)) !== null) {
-                  allLinks.push(match[1]);
-                }
-
-                const fs = require('fs');
-                fs.mkdirSync('inbox', { recursive: true });
-                const now = new Date().toISOString().replace(/[:.]/g, '-');
-                const outPath = `inbox/${now}-second-cloudflare-email.txt`;
-                const content = [
-                  `From: ${mailFrom}`,
-                  `Subject: ${mailSubject}`,
-                  `Date: ${new Date().toString()}`,
-                  '',
-                  'HTML BODY:',
-                  '--------------------------------------------------',
-                  bodyHTML,
-                  '',
-                  'ALL LINKS FOUND:',
-                  ...allLinks.map(l => `  • ${l}`),
-                  ''
-                ].join('\n');
-                fs.writeFileSync(outPath, content, 'utf-8');
-                console.log(`Email saved to ${outPath}`);
-                console.log('All links:');
-                allLinks.forEach(l => console.log('  ', l));
-                emailSaved = true;
-                break;
+                saveEmail({
+                  mail_from: mailFrom,
+                  mail_subject: mailSubject,
+                }, { mail_html: bodyHTML, mail_body: '' }, allLinks);
+                await browser.close();
+                return;
               }
 
               await page.waitForTimeout(10000);
             }
 
             await browser.close();
-            if (!emailSaved) {
-              process.exit(1);
+            process.exit(1);
+
+            // Helper to save email
+            function saveEmail(meta, full, links = null) {
+              const fs = require('fs');
+              fs.mkdirSync('inbox', { recursive: true });
+              const now = new Date().toISOString().replace(/[:.]/g, '-');
+              const outPath = `inbox/${now}-second-cloudflare-email.txt`;
+              const bodyHTML = full.mail_html || '';
+              const linkRegex = /href="([^"]+)"/g;
+              const allLinks = links || [];
+              if (!links) {
+                let m;
+                while ((m = linkRegex.exec(bodyHTML)) !== null) allLinks.push(m[1]);
+              }
+              const content = [
+                `From: ${meta.mail_from || 'unknown'}`,
+                `Subject: ${meta.mail_subject || '(no subject)'}`,
+                `Date: ${new Date().toString()}`,
+                '',
+                'HTML BODY:',
+                '--------------------------------------------------',
+                bodyHTML,
+                '',
+                'ALL LINKS FOUND:',
+                ...allLinks.map(l => `  • ${l}`),
+                ''
+              ].join('\n');
+              fs.writeFileSync(outPath, content, 'utf-8');
+              console.log(`Email saved to ${outPath}`);
+              console.log('All links:');
+              allLinks.forEach(l => console.log('  ', l));
             }
           })();
           SCRIPT
