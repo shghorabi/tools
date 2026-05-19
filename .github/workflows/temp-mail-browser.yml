@@ -49,6 +49,7 @@ jobs:
             git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
             git push --set-upstream origin ${{ inputs.branch_name }}
           fi
+          
       - name: Run Playwright script to get second email
         run: |
           cat > ./get-inbox.js << 'SCRIPT'
@@ -63,7 +64,7 @@ jobs:
 
             await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
 
-            // ---- Get the temporary email address ----
+            // ---- Get the temporary email address and SID token ----
             let email = '';
             try {
               await page.waitForSelector('#email-widget', { timeout: 10000 });
@@ -78,39 +79,76 @@ jobs:
               const match = bodyText.match(/[\w.-]+@[\w.-]+\.\w+/);
               email = match ? match[0] : 'UNKNOWN';
             }
+
+            // Extract the sid_token (used for API calls) from the page's global JS
+            const sidToken = await page.evaluate(() => {
+              // Guerrilla Mail stores it in a global variable or data attribute
+              if (window.guerrilla && window.guerrilla.sid_token) return window.guerrilla.sid_token;
+              const scripts = document.querySelectorAll('script');
+              for (let s of scripts) {
+                const m = s.textContent.match(/sid_token\s*=\s*['"]([^'"]+)['"]/);
+                if (m) return m[1];
+              }
+              return null;
+            });
+
+            if (!sidToken) {
+              console.error('Could not extract sid_token from page – aborting.');
+              process.exit(1);
+            }
+
             console.log('==============================================');
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
-            console.log('Waiting for THREE emails (ignoring the welcome email,');
-            console.log('then taking the 3rd one = your 2nd Cloudflare email)...');
+            console.log('Waiting for THREE emails (ignoring the welcome email)...');
             console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
+            const apiBase = 'https://www.guerrillamail.com/ajax.php';
             const start = Date.now();
             let emailSaved = false;
+
             while (true) {
               const elapsed = (Date.now() - start) / 1000;
               if (elapsed >= TIMEOUT_SECONDS) {
-                console.log('❌ Timeout: Only found ' + rows.length + ' email(s).');
+                console.log('❌ Timeout: only found fewer than 3 emails.');
                 const fs = require('fs');
                 fs.mkdirSync('inbox', { recursive: true });
                 fs.writeFileSync('inbox/timeout.txt', 'Timed out waiting for third email.', 'utf-8');
                 break;
               }
 
-              const rows = await page.$$('tr.mail_row');
-              const rowCount = rows.length;
-              console.log(`Checked at ${Math.round(elapsed)}s – ${rowCount} email(s) found.`);
+              // Fetch the list of emails via the API (browser makes the request)
+              const listResponse = await page.evaluate(async (token) => {
+                const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { mode: 'cors' });
+                return resp.json();
+              }, sidToken);
 
-              if (rowCount >= 3) {
-                console.log('✅ Three emails received! Opening the third one (your second Cloudflare email)...');
-                // Click the 3rd row (index 2)
-                await rows[2].click();
-                await page.waitForSelector('.email_body', { timeout: 10000 });
+              const emailList = listResponse.list || [];
+              const count = emailList.length;
+              console.log(`Checked at ${Math.round(elapsed)}s – ${count} email(s) found.`);
 
-                const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
-                const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => '(no subject)');
-                const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
-                const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
+              if (count >= 3) {
+                console.log('✅ Three emails received! Fetching the third email...');
+                const thirdEmail = emailList[2]; // index 2 is the third email (your second Cloudflare email)
+
+                // Fetch the full content of the third email
+                const fullEmail = await page.evaluate(async (token, mailId) => {
+                  const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}&id=${mailId}`, { mode: 'cors' });
+                  return resp.json();
+                }, sidToken, thirdEmail.mail_id);
+
+                const mailFrom = thirdEmail.mail_from || 'unknown';
+                const mailSubject = thirdEmail.mail_subject || '(no subject)';
+                const bodyHTML = fullEmail.mail_html || '';
+                const bodyText = fullEmail.mail_body || '';
+
+                // Extract all links from HTML body
+                const linkRegex = /href="([^"]+)"/g;
+                const allLinks = [];
+                let match;
+                while ((match = linkRegex.exec(bodyHTML)) !== null) {
+                  allLinks.push(match[1]);
+                }
 
                 const fs = require('fs');
                 fs.mkdirSync('inbox', { recursive: true });
@@ -137,6 +175,7 @@ jobs:
                 break;
               }
 
+              // Wait 10 seconds before next check
               await page.waitForTimeout(10000);
             }
 
