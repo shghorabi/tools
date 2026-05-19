@@ -49,14 +49,12 @@ jobs:
             git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
             git push --set-upstream origin ${{ inputs.branch_name }}
           fi
-          
       - name: Run Playwright script to get second email
         run: |
           cat > ./get-inbox.js << 'SCRIPT'
           const { chromium } = require('playwright');
 
-          // Read timeout from environment (in seconds)
-          const TIMEOUT_SECONDS = parseInt(process.env.TIMEOUT_SECONDS || '900', 10); // default 15 min
+          const TIMEOUT_SECONDS = parseInt(process.env.TIMEOUT_SECONDS || '900', 10);
 
           (async () => {
             const browser = await chromium.launch();
@@ -83,29 +81,30 @@ jobs:
             console.log('==============================================');
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
-            console.log('Waiting for TWO emails (only the 2nd will be saved)...');
+            console.log('Waiting for THREE emails (ignoring the welcome email,');
+            console.log('then taking the 3rd one = your 2nd Cloudflare email)...');
             console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
-            // ---- Manual polling loop to wait for 2 emails ----
             const start = Date.now();
-            let secondEmailSaved = false;
+            let emailSaved = false;
             while (true) {
               const elapsed = (Date.now() - start) / 1000;
               if (elapsed >= TIMEOUT_SECONDS) {
-                console.log('❌ Timeout: Only found fewer than 2 emails.');
+                console.log('❌ Timeout: Only found ' + rows.length + ' email(s).');
                 const fs = require('fs');
                 fs.mkdirSync('inbox', { recursive: true });
-                fs.writeFileSync('inbox/timeout.txt', 'Timed out waiting for second email.', 'utf-8');
+                fs.writeFileSync('inbox/timeout.txt', 'Timed out waiting for third email.', 'utf-8');
                 break;
               }
 
-              const rowCount = await page.$$eval('tr.mail_row', rows => rows.length).catch(() => 0);
+              const rows = await page.$$('tr.mail_row');
+              const rowCount = rows.length;
               console.log(`Checked at ${Math.round(elapsed)}s – ${rowCount} email(s) found.`);
 
-              if (rowCount >= 2) {
-                console.log('✅ Two emails received! Opening the second one...');
-                const rows = await page.$$('tr.mail_row');
-                await rows[1].click();
+              if (rowCount >= 3) {
+                console.log('✅ Three emails received! Opening the third one (your second Cloudflare email)...');
+                // Click the 3rd row (index 2)
+                await rows[2].click();
                 await page.waitForSelector('.email_body', { timeout: 10000 });
 
                 const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
@@ -116,7 +115,7 @@ jobs:
                 const fs = require('fs');
                 fs.mkdirSync('inbox', { recursive: true });
                 const now = new Date().toISOString().replace(/[:.]/g, '-');
-                const outPath = `inbox/${now}-second-email.txt`;
+                const outPath = `inbox/${now}-second-cloudflare-email.txt`;
                 const content = [
                   `From: ${mailFrom}`,
                   `Subject: ${mailSubject}`,
@@ -134,23 +133,22 @@ jobs:
                 console.log(`Email saved to ${outPath}`);
                 console.log('All links:');
                 allLinks.forEach(l => console.log('  ', l));
-                secondEmailSaved = true;
+                emailSaved = true;
                 break;
               }
 
-              // Wait 10 seconds before next check
               await page.waitForTimeout(10000);
             }
 
             await browser.close();
-            if (!secondEmailSaved) {
-              process.exit(1); // signal failure to GitHub
+            if (!emailSaved) {
+              process.exit(1);
             }
           })();
           SCRIPT
 
           export TIMEOUT_SECONDS=$(( ${{ inputs.timeout_minutes }} * 60 ))
-          node ./get-inbox.js          
+          node ./get-inbox.js
           
       - name: Commit and push email
         if: always()
