@@ -55,6 +55,9 @@ jobs:
           cat > ./get-inbox.js << 'SCRIPT'
           const { chromium } = require('playwright');
 
+          // Read timeout from environment (in seconds)
+          const TIMEOUT_SECONDS = parseInt(process.env.TIMEOUT_SECONDS || '900', 10); // default 15 min
+
           (async () => {
             const browser = await chromium.launch();
             const context = await browser.newContext({ ignoreHTTPSErrors: true });
@@ -65,17 +68,13 @@ jobs:
             // ---- Get the temporary email address ----
             let email = '';
             try {
-              // Try the original input field selector
               await page.waitForSelector('#email-widget', { timeout: 10000 });
               email = await page.$eval('#email-widget', el => {
-                // Use value for <input>, otherwise fall back to textContent
                 return (el.value || el.textContent || '').trim();
               });
             } catch (e) {
               console.log('Primary email selector failed, trying fallback...');
             }
-
-            // If still empty, extract any email-like text from the page
             if (!email || !email.includes('@')) {
               const bodyText = await page.evaluate(() => document.body.innerText);
               const match = bodyText.match(/[\w.-]+@[\w.-]+\.\w+/);
@@ -85,53 +84,73 @@ jobs:
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
             console.log('Waiting for TWO emails (only the 2nd will be saved)...');
+            console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
-            // Wait for at least 2 email rows
-            await page.waitForFunction(() => {
-              const rows = document.querySelectorAll('tr.mail_row');
-              return rows.length >= 2;
-            }, { polling: 5000 });
+            // ---- Manual polling loop to wait for 2 emails ----
+            const start = Date.now();
+            let secondEmailSaved = false;
+            while (true) {
+              const elapsed = (Date.now() - start) / 1000;
+              if (elapsed >= TIMEOUT_SECONDS) {
+                console.log('❌ Timeout: Only found fewer than 2 emails.');
+                const fs = require('fs');
+                fs.mkdirSync('inbox', { recursive: true });
+                fs.writeFileSync('inbox/timeout.txt', 'Timed out waiting for second email.', 'utf-8');
+                break;
+              }
 
-            console.log('✅ Two emails received! Opening the second one...');
+              const rowCount = await page.$$eval('tr.mail_row', rows => rows.length).catch(() => 0);
+              console.log(`Checked at ${Math.round(elapsed)}s – ${rowCount} email(s) found.`);
 
-            const rows = await page.$$('tr.mail_row');
-            await rows[1].click();
+              if (rowCount >= 2) {
+                console.log('✅ Two emails received! Opening the second one...');
+                const rows = await page.$$('tr.mail_row');
+                await rows[1].click();
+                await page.waitForSelector('.email_body', { timeout: 10000 });
 
-            await page.waitForSelector('.email_body', { timeout: 10000 });
+                const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
+                const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => '(no subject)');
+                const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
+                const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
 
-            const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
-            const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => '(no subject)');
-            const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
-            const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
+                const fs = require('fs');
+                fs.mkdirSync('inbox', { recursive: true });
+                const now = new Date().toISOString().replace(/[:.]/g, '-');
+                const outPath = `inbox/${now}-second-email.txt`;
+                const content = [
+                  `From: ${mailFrom}`,
+                  `Subject: ${mailSubject}`,
+                  `Date: ${new Date().toString()}`,
+                  '',
+                  'HTML BODY:',
+                  '--------------------------------------------------',
+                  bodyHTML,
+                  '',
+                  'ALL LINKS FOUND:',
+                  ...allLinks.map(l => `  • ${l}`),
+                  ''
+                ].join('\n');
+                fs.writeFileSync(outPath, content, 'utf-8');
+                console.log(`Email saved to ${outPath}`);
+                console.log('All links:');
+                allLinks.forEach(l => console.log('  ', l));
+                secondEmailSaved = true;
+                break;
+              }
 
-            const fs = require('fs');
-            fs.mkdirSync('inbox', { recursive: true });
-            const now = new Date().toISOString().replace(/[:.]/g, '-');
-            const outPath = `inbox/${now}-second-email.txt`;
-            const content = [
-              `From: ${mailFrom}`,
-              `Subject: ${mailSubject}`,
-              `Date: ${new Date().toString()}`,
-              '',
-              'HTML BODY:',
-              '--------------------------------------------------',
-              bodyHTML,
-              '',
-              'ALL LINKS FOUND:',
-              ...allLinks.map(l => `  • ${l}`),
-              ''
-            ].join('\n');
-
-            fs.writeFileSync(outPath, content, 'utf-8');
-            console.log(`Email saved to ${outPath}`);
-            console.log('All links:');
-            allLinks.forEach(l => console.log('  ', l));
+              // Wait 10 seconds before next check
+              await page.waitForTimeout(10000);
+            }
 
             await browser.close();
+            if (!secondEmailSaved) {
+              process.exit(1); // signal failure to GitHub
+            }
           })();
           SCRIPT
 
-          node ./get-inbox.js
+          export TIMEOUT_SECONDS=$(( ${{ inputs.timeout_minutes }} * 60 ))
+          node ./get-inbox.js          
           
       - name: Commit and push email
         if: always()
