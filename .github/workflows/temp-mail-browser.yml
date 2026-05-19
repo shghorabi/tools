@@ -49,7 +49,7 @@ jobs:
             git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
             git push --set-upstream origin ${{ inputs.branch_name }}
           fi
-
+          
       - name: Run Playwright script to get second email
         run: |
           cat > ./get-inbox.js << 'SCRIPT'
@@ -62,13 +62,31 @@ jobs:
 
             await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
 
-            await page.waitForSelector('#email-widget', { timeout: 10000 });
-            let email = await page.$eval('#email-widget', el => el.value.trim());
+            // ---- Get the temporary email address ----
+            let email = '';
+            try {
+              // Try the original input field selector
+              await page.waitForSelector('#email-widget', { timeout: 10000 });
+              email = await page.$eval('#email-widget', el => {
+                // Use value for <input>, otherwise fall back to textContent
+                return (el.value || el.textContent || '').trim();
+              });
+            } catch (e) {
+              console.log('Primary email selector failed, trying fallback...');
+            }
+
+            // If still empty, extract any email-like text from the page
+            if (!email || !email.includes('@')) {
+              const bodyText = await page.evaluate(() => document.body.innerText);
+              const match = bodyText.match(/[\w.-]+@[\w.-]+\.\w+/);
+              email = match ? match[0] : 'UNKNOWN';
+            }
             console.log('==============================================');
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
             console.log('Waiting for TWO emails (only the 2nd will be saved)...');
 
+            // Wait for at least 2 email rows
             await page.waitForFunction(() => {
               const rows = document.querySelectorAll('tr.mail_row');
               return rows.length >= 2;
@@ -114,7 +132,7 @@ jobs:
           SCRIPT
 
           node ./get-inbox.js
-
+          
       - name: Commit and push email
         if: always()
         run: |
