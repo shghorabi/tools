@@ -1,4 +1,4 @@
-name: Temporary Email Inbox (1secmail)
+name: Temporary Email Inbox (1secmail – fixed)
 
 on:
   workflow_dispatch:
@@ -46,10 +46,10 @@ jobs:
       - name: Get temporary inbox and wait for second email
         id: inbox
         run: |
-          # 1secmail – generate a random email
+          # Generate a safe random username (no broken pipes)
+          USERNAME=$(uuidgen | tr -d '-' | head -c 10)
           DOMAINS=("1secmail.com" "1secmail.org" "1secmail.net" "wwjmp.com" "esiix.com" "xojxe.com" "yoggm.com")
           RANDOM_DOMAIN=${DOMAINS[$RANDOM % ${#DOMAINS[@]}]}
-          USERNAME=$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c 10)
           EMAIL="${USERNAME}@${RANDOM_DOMAIN}"
           API_BASE="https://www.1secmail.com/api/v1"
 
@@ -67,18 +67,47 @@ jobs:
           while true; do
             sleep 10
 
-            # fetch all emails
-            RESPONSE=$(curl -s "${API_BASE}/?action=getMessages&login=${USERNAME}&domain=${RANDOM_DOMAIN}")
+            # Retry the API call up to 3 times if it fails
+            for retry in 1 2 3; do
+              RESPONSE=$(curl -s --max-time 10 "${API_BASE}/?action=getMessages&login=${USERNAME}&domain=${RANDOM_DOMAIN}")
+              # Check if it's valid JSON (any opening bracket)
+              if echo "$RESPONSE" | jq empty 2>/dev/null; then
+                break
+              fi
+              echo "API returned invalid JSON, retrying ($retry/3)..."
+              sleep 2
+            done
+
+            # If still not valid JSON, skip this poll iteration
+            if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
+              echo "API unavailable, will retry on next loop..."
+              # Check timeout before continuing
+              NOW=$(date +%s)
+              if [ $((NOW - START_TIME)) -ge $TIMEOUT_SECONDS ]; then
+                echo "Timeout reached while API was down."
+                mkdir -p inbox
+                echo "Timed out – API was unresponsive." > "inbox/$(date +%Y%m%d-%H%M%S)-timeout.txt"
+                exit 1
+              fi
+              continue
+            fi
+
             COUNT=$(echo "$RESPONSE" | jq '. | length')
 
             if [ "$COUNT" -ge 2 ]; then
               echo "✅ Received $COUNT emails."
 
-              # Get the ID of the second email (index 1)
               SECOND_ID=$(echo "$RESPONSE" | jq -r '.[1].id')
 
-              # Fetch the full email
-              FULL=$(curl -s "${API_BASE}/?action=readMessage&login=${USERNAME}&domain=${RANDOM_DOMAIN}&id=${SECOND_ID}")
+              # Fetch the full second email (with retry)
+              for retry in 1 2 3; do
+                FULL=$(curl -s --max-time 10 "${API_BASE}/?action=readMessage&login=${USERNAME}&domain=${RANDOM_DOMAIN}&id=${SECOND_ID}")
+                if echo "$FULL" | jq empty 2>/dev/null; then
+                  break
+                fi
+                sleep 2
+              done
+
               MAIL_FROM=$(echo "$FULL" | jq -r '.from')
               MAIL_SUBJECT=$(echo "$FULL" | jq -r '.subject')
               MAIL_BODY=$(echo "$FULL" | jq -r '.textBody')
@@ -126,9 +155,13 @@ jobs:
             fi
           done
 
-      - name: Commit and push
+      - name: Commit and push (only if email was saved)
         if: always()
         run: |
-          git add inbox/
-          git commit -m "[bot] Second email (1secmail) on branch ${{ inputs.branch_name }}"
-          git push origin ${{ inputs.branch_name }}
+          if [ -d "inbox" ] && [ "$(ls -A inbox 2>/dev/null)" ]; then
+            git add inbox/
+            git commit -m "[bot] Second email (1secmail) on branch ${{ inputs.branch_name }}"
+            git push origin ${{ inputs.branch_name }}
+          else
+            echo "No email files to commit."
+          fi
