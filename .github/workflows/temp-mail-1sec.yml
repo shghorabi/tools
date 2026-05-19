@@ -1,4 +1,4 @@
-name: Temporary Email Inbox (1secmail – fixed)
+name: Temporary Email Inbox (Maildrop)
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
       branch_name:
         description: 'Branch name'
         required: true
-        default: 'temp-mail-1sec'
+        default: 'temp-mail-maildrop'
         type: string
       timeout_minutes:
         description: 'Max wait (minutes)'
@@ -46,12 +46,11 @@ jobs:
       - name: Get temporary inbox and wait for second email
         id: inbox
         run: |
-          # Generate a safe random username (no broken pipes)
-          USERNAME=$(uuidgen | tr -d '-' | head -c 10)
-          DOMAINS=("1secmail.com" "1secmail.org" "1secmail.net" "wwjmp.com" "esiix.com" "xojxe.com" "yoggm.com")
-          RANDOM_DOMAIN=${DOMAINS[$RANDOM % ${#DOMAINS[@]}]}
-          EMAIL="${USERNAME}@${RANDOM_DOMAIN}"
-          API_BASE="https://www.1secmail.com/api/v1"
+          # Generate random mailbox name (Maildrop auto-creates it)
+          MAILBOX="github-$(uuidgen | tr -d '-' | head -c 10)"
+          DOMAIN="maildrop.cc"
+          EMAIL="${MAILBOX}@${DOMAIN}"
+          API_URL="https://api.maildrop.cc/v2/inbox/${MAILBOX}"
 
           echo ""
           echo "=============================================="
@@ -67,24 +66,15 @@ jobs:
           while true; do
             sleep 10
 
-            # Retry the API call up to 3 times if it fails
-            for retry in 1 2 3; do
-              RESPONSE=$(curl -s --max-time 10 "${API_BASE}/?action=getMessages&login=${USERNAME}&domain=${RANDOM_DOMAIN}")
-              # Check if it's valid JSON (any opening bracket)
-              if echo "$RESPONSE" | jq empty 2>/dev/null; then
-                break
-              fi
-              echo "API returned invalid JSON, retrying ($retry/3)..."
-              sleep 2
-            done
+            # Fetch inbox (returns { "messages": [...] })
+            RESPONSE=$(curl -s --max-time 10 "${API_URL}")
 
-            # If still not valid JSON, skip this poll iteration
+            # Validate JSON
             if ! echo "$RESPONSE" | jq empty 2>/dev/null; then
-              echo "API unavailable, will retry on next loop..."
-              # Check timeout before continuing
+              echo "API returned invalid JSON, retrying..."
               NOW=$(date +%s)
               if [ $((NOW - START_TIME)) -ge $TIMEOUT_SECONDS ]; then
-                echo "Timeout reached while API was down."
+                echo "Timeout while API was unresponsive."
                 mkdir -p inbox
                 echo "Timed out – API was unresponsive." > "inbox/$(date +%Y%m%d-%H%M%S)-timeout.txt"
                 exit 1
@@ -92,26 +82,18 @@ jobs:
               continue
             fi
 
-            COUNT=$(echo "$RESPONSE" | jq '. | length')
+            COUNT=$(echo "$RESPONSE" | jq '.messages | length')
 
             if [ "$COUNT" -ge 2 ]; then
               echo "✅ Received $COUNT emails."
 
-              SECOND_ID=$(echo "$RESPONSE" | jq -r '.[1].id')
-
-              # Fetch the full second email (with retry)
-              for retry in 1 2 3; do
-                FULL=$(curl -s --max-time 10 "${API_BASE}/?action=readMessage&login=${USERNAME}&domain=${RANDOM_DOMAIN}&id=${SECOND_ID}")
-                if echo "$FULL" | jq empty 2>/dev/null; then
-                  break
-                fi
-                sleep 2
-              done
-
-              MAIL_FROM=$(echo "$FULL" | jq -r '.from')
-              MAIL_SUBJECT=$(echo "$FULL" | jq -r '.subject')
-              MAIL_BODY=$(echo "$FULL" | jq -r '.textBody')
-              MAIL_HTML=$(echo "$FULL" | jq -r '.htmlBody // ""')
+              # Second message (index 1)
+              SECOND=$(echo "$RESPONSE" | jq '.messages[1]')
+              MAIL_ID=$(echo "$SECOND" | jq -r '.id')
+              MAIL_FROM=$(echo "$SECOND" | jq -r '.from')
+              MAIL_SUBJECT=$(echo "$SECOND" | jq -r '.subject')
+              MAIL_BODY=$(echo "$SECOND" | jq -r '.textBody')
+              MAIL_HTML=$(echo "$SECOND" | jq -r '.html // ""')
 
               # Extract links from HTML
               if [ -n "$MAIL_HTML" ]; then
@@ -160,7 +142,7 @@ jobs:
         run: |
           if [ -d "inbox" ] && [ "$(ls -A inbox 2>/dev/null)" ]; then
             git add inbox/
-            git commit -m "[bot] Second email (1secmail) on branch ${{ inputs.branch_name }}"
+            git commit -m "[bot] Second email (Maildrop) on branch ${{ inputs.branch_name }}"
             git push origin ${{ inputs.branch_name }}
           else
             echo "No email files to commit."
