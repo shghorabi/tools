@@ -17,8 +17,6 @@ on:
 jobs:
   temp-mail:
     runs-on: ubuntu-latest
-    container:
-      image: mcr.microsoft.com/playwright:latest   # prebuilt Playwright + Chromium + git
     permissions:
       contents: write
 
@@ -28,6 +26,11 @@ jobs:
         with:
           persist-credentials: true
           fetch-depth: 0
+
+      - name: Install Playwright & system dependencies
+        run: |
+          npx playwright install-deps chromium
+          npx playwright install chromium
 
       - name: Prepare branch
         run: |
@@ -58,38 +61,36 @@ jobs:
             // 1. Open Guerrilla Mail
             await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
 
-            // 2. Wait for the email address to appear and read it
-            await page.waitForSelector('#email-widget', { timeout: 10000 }); // the text field containing the address
+            // 2. Read the generated address
+            await page.waitForSelector('#email-widget', { timeout: 10000 });
             let email = await page.$eval('#email-widget', el => el.value.trim());
             console.log('==============================================');
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
             console.log('Waiting for TWO emails (only the 2nd will be saved)...');
 
-            // 3. Wait until at least 2 emails appear in the inbox
-            //    Guerrilla Mail adds rows with class "mail_row" (or "email" class on <tr>)
-            //    We'll use a function that counts visible rows.
+            // 3. Wait until at least 2 email rows are visible
             await page.waitForFunction(() => {
               const rows = document.querySelectorAll('tr.mail_row');
               return rows.length >= 2;
-            }, { timeout: 0, polling: 5000 }); // 0 timeout means wait forever (until we cancel)
+            }, { polling: 5000 });
 
             console.log('✅ Two emails received! Opening the second one...');
 
-            // 4. Click on the SECOND email row (index 1)
+            // 4. Click the second row (index 1)
             const rows = await page.$$('tr.mail_row');
             await rows[1].click();
 
             // 5. Wait for the email body to load
             await page.waitForSelector('.email_body', { timeout: 10000 });
 
-            // 6. Extract the email content and all links
+            // 6. Extract details
             const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
             const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => '(no subject)');
             const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
             const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
 
-            // 7. Save to a file
+            // 7. Save to file
             const fs = require('fs');
             fs.mkdirSync('inbox', { recursive: true });
             const now = new Date().toISOString().replace(/[:.]/g, '-');
