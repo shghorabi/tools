@@ -1,0 +1,134 @@
+name: Temporary Email Inbox (1secmail)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name'
+        required: true
+        default: 'temp-mail-1sec'
+        type: string
+      timeout_minutes:
+        description: 'Max wait (minutes)'
+        required: false
+        default: '15'
+        type: string
+
+jobs:
+  temp-mail:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Prepare branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin ${{ inputs.branch_name }}; then
+            git checkout ${{ inputs.branch_name }}
+            git pull origin ${{ inputs.branch_name }}
+          else
+            git checkout --orphan ${{ inputs.branch_name }}
+            git rm -rf . || true
+            git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
+            git push --set-upstream origin ${{ inputs.branch_name }}
+          fi
+
+      - name: Get temporary inbox and wait for second email
+        id: inbox
+        run: |
+          # 1secmail – generate a random email
+          DOMAINS=("1secmail.com" "1secmail.org" "1secmail.net" "wwjmp.com" "esiix.com" "xojxe.com" "yoggm.com")
+          RANDOM_DOMAIN=${DOMAINS[$RANDOM % ${#DOMAINS[@]}]}
+          USERNAME=$(cat /dev/urandom | tr -dc 'a-z0-9' | head -c 10)
+          EMAIL="${USERNAME}@${RANDOM_DOMAIN}"
+          API_BASE="https://www.1secmail.com/api/v1"
+
+          echo ""
+          echo "=============================================="
+          echo "  TEMP EMAIL: $EMAIL"
+          echo "=============================================="
+          echo "Waiting for TWO emails (only the 2nd will be saved)."
+          echo ""
+
+          TIMEOUT_SECONDS=$(( ${{ inputs.timeout_minutes }} * 60 ))
+          START_TIME=$(date +%s)
+          FIRST_SEEN=0
+
+          while true; do
+            sleep 10
+
+            # fetch all emails
+            RESPONSE=$(curl -s "${API_BASE}/?action=getMessages&login=${USERNAME}&domain=${RANDOM_DOMAIN}")
+            COUNT=$(echo "$RESPONSE" | jq '. | length')
+
+            if [ "$COUNT" -ge 2 ]; then
+              echo "✅ Received $COUNT emails."
+
+              # Get the ID of the second email (index 1)
+              SECOND_ID=$(echo "$RESPONSE" | jq -r '.[1].id')
+
+              # Fetch the full email
+              FULL=$(curl -s "${API_BASE}/?action=readMessage&login=${USERNAME}&domain=${RANDOM_DOMAIN}&id=${SECOND_ID}")
+              MAIL_FROM=$(echo "$FULL" | jq -r '.from')
+              MAIL_SUBJECT=$(echo "$FULL" | jq -r '.subject')
+              MAIL_BODY=$(echo "$FULL" | jq -r '.textBody')
+              MAIL_HTML=$(echo "$FULL" | jq -r '.htmlBody // ""')
+
+              # Extract links from HTML
+              if [ -n "$MAIL_HTML" ]; then
+                LINKS=$(echo "$MAIL_HTML" | grep -oP 'href="\K[^"]+' | grep -E '^https?://' || echo "No links found")
+              else
+                LINKS="No HTML body available."
+              fi
+
+              mkdir -p inbox
+              OUTFILE="inbox/$(date +%Y%m%d-%H%M%S)-second-email.txt"
+              {
+                echo "From: $MAIL_FROM"
+                echo "Subject: $MAIL_SUBJECT"
+                echo "Date: $(date)"
+                echo "--------------------------------------------------"
+                echo "PLAIN TEXT BODY:"
+                echo "$MAIL_BODY"
+                echo ""
+                echo "LINKS FOUND IN HTML:"
+                echo "$LINKS"
+              } > "$OUTFILE"
+
+              echo "Email saved to $OUTFILE"
+              exit 0
+
+            elif [ "$COUNT" -eq 1 ]; then
+              if [ "$FIRST_SEEN" -eq 0 ]; then
+                echo "First email arrived, waiting for second..."
+                FIRST_SEEN=1
+              fi
+            else
+              echo "No emails yet..."
+            fi
+
+            NOW=$(date +%s)
+            if [ $((NOW - START_TIME)) -ge $TIMEOUT_SECONDS ]; then
+              echo "Timeout: Only $COUNT email(s) received."
+              mkdir -p inbox
+              echo "Timed out waiting for second email." > "inbox/$(date +%Y%m%d-%H%M%S)-timeout.txt"
+              exit 1
+            fi
+          done
+
+      - name: Commit and push
+        if: always()
+        run: |
+          git add inbox/
+          git commit -m "[bot] Second email (1secmail) on branch ${{ inputs.branch_name }}"
+          git push origin ${{ inputs.branch_name }}
