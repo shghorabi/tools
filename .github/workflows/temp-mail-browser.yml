@@ -29,10 +29,8 @@ jobs:
 
       - name: Install Playwright & browser
         run: |
-          # Initialize a Node project and install playwright locally
           npm init -y
           npm install playwright
-          # Install system dependencies required by Chromium
           npx playwright install-deps chromium
           npx playwright install chromium
 
@@ -54,7 +52,7 @@ jobs:
 
       - name: Run Playwright script to get second email
         run: |
-          cat > /tmp/get-inbox.js << 'SCRIPT'
+          cat > ./get-inbox.js << 'SCRIPT'
           const { chromium } = require('playwright');
 
           (async () => {
@@ -62,10 +60,8 @@ jobs:
             const context = await browser.newContext({ ignoreHTTPSErrors: true });
             const page = await context.newPage();
 
-            // 1. Open Guerrilla Mail
             await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
 
-            // 2. Read the generated address
             await page.waitForSelector('#email-widget', { timeout: 10000 });
             let email = await page.$eval('#email-widget', el => el.value.trim());
             console.log('==============================================');
@@ -73,7 +69,6 @@ jobs:
             console.log('==============================================');
             console.log('Waiting for TWO emails (only the 2nd will be saved)...');
 
-            // 3. Wait until at least 2 email rows are visible
             await page.waitForFunction(() => {
               const rows = document.querySelectorAll('tr.mail_row');
               return rows.length >= 2;
@@ -81,20 +76,16 @@ jobs:
 
             console.log('✅ Two emails received! Opening the second one...');
 
-            // 4. Click the second row (index 1)
             const rows = await page.$$('tr.mail_row');
             await rows[1].click();
 
-            // 5. Wait for the email body to load
             await page.waitForSelector('.email_body', { timeout: 10000 });
 
-            // 6. Extract details
             const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
             const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => '(no subject)');
             const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
             const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
 
-            // 7. Save to file
             const fs = require('fs');
             fs.mkdirSync('inbox', { recursive: true });
             const now = new Date().toISOString().replace(/[:.]/g, '-');
@@ -122,7 +113,7 @@ jobs:
           })();
           SCRIPT
 
-          node /tmp/get-inbox.js
+          node ./get-inbox.js
 
       - name: Commit and push email
         if: always()
