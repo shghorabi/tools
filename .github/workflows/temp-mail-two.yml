@@ -1,0 +1,119 @@
+name: Temporary Email Inbox (Two Emails)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name (for simultaneous runs)'
+        required: true
+        default: 'temp-mail'
+        type: string
+      timeout_minutes:
+        description: 'Max wait time for the 2nd email (minutes)'
+        required: false
+        default: '15'
+        type: string
+
+jobs:
+  temp-mail-two:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Prepare branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin ${{ inputs.branch_name }}; then
+            git checkout ${{ inputs.branch_name }}
+            git pull origin ${{ inputs.branch_name }}
+          else
+            git checkout --orphan ${{ inputs.branch_name }}
+            git rm -rf . || true
+            git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
+            git push --set-upstream origin ${{ inputs.branch_name }}
+          fi
+
+      - name: Get temporary inbox and wait for second email
+        id: inbox
+        run: |
+          # 1. Request a new inbox
+          RESPONSE=$(curl -s "https://api.guerrillamail.com/ajax.php?f=get_email_address")
+          EMAIL=$(echo "$RESPONSE" | jq -r '.email_addr')
+          SID_TOKEN=$(echo "$RESPONSE" | jq -r '.sid_token')
+
+          echo ""
+          echo "=============================================="
+          echo "  YOUR TEMPORARY EMAIL ADDRESS:"
+          echo "  📧 $EMAIL"
+          echo "=============================================="
+          echo "Waiting until TWO emails arrive (the second one will be saved)."
+          echo ""
+
+          TIMEOUT_SECONDS=$(( ${{ inputs.timeout_minutes }} * 60 ))
+          START_TIME=$(date +%s)
+
+          while true; do
+            sleep 10
+
+            # Fetch all emails (the API returns { "list": [...] } )
+            FETCH=$(curl -s "https://api.guerrillamail.com/ajax.php?f=fetch_email&sid_token=$SID_TOKEN")
+            LIST_LENGTH=$(echo "$FETCH" | jq '.list | length')
+
+            if [ "$LIST_LENGTH" -ge 2 ]; then
+              echo "✅ Received $LIST_LENGTH emails so far."
+
+              # Get the second email (index 1)
+              SECOND=$(echo "$FETCH" | jq '.list[1]')
+              MAIL_FROM=$(echo "$SECOND" | jq -r '.mail_from')
+              MAIL_SUBJECT=$(echo "$SECOND" | jq -r '.mail_subject')
+              MAIL_BODY=$(echo "$SECOND" | jq -r '.mail_body')
+
+              echo "--- Second email (saved to branch) ---"
+              echo "From: $MAIL_FROM"
+              echo "Subject: $MAIL_SUBJECT"
+              echo "---------------------------------------"
+
+              mkdir -p inbox
+              OUTFILE="inbox/$(date +%Y%m%d-%H%M%S)-second-email.txt"
+              {
+                echo "From: $MAIL_FROM"
+                echo "Subject: $MAIL_SUBJECT"
+                echo "Date: $(date)"
+                echo "--------------------------------------------------"
+                echo "$MAIL_BODY"
+              } > "$OUTFILE"
+
+              echo "Email saved to $OUTFILE"
+              exit 0
+            elif [ "$LIST_LENGTH" -eq 1 ]; then
+              echo "Received first email, still waiting for the second..."
+            else
+              echo "No emails yet..."
+            fi
+
+            # Check timeout
+            NOW=$(date +%s)
+            if [ $((NOW - START_TIME)) -ge $TIMEOUT_SECONDS ]; then
+              echo "Timeout: Only $LIST_LENGTH email(s) received."
+              mkdir -p inbox
+              echo "Timed out waiting for second email." > "inbox/$(date +%Y%m%d-%H%M%S)-timeout.txt"
+              exit 1
+            fi
+          done
+
+      - name: Commit and push second email
+        if: always()
+        run: |
+          git add inbox/
+          git commit -m "[bot] Second email received on branch ${{ inputs.branch_name }}"
+          git push origin ${{ inputs.branch_name }}
