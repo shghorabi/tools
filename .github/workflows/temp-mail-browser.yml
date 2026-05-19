@@ -1,0 +1,131 @@
+name: Temp Email via Browser (Guerrilla Mail)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name'
+        required: true
+        default: 'temp-mail-browser'
+        type: string
+      timeout_minutes:
+        description: 'Max wait (minutes)'
+        required: false
+        default: '15'
+        type: string
+
+jobs:
+  temp-mail:
+    runs-on: ubuntu-latest
+    container:
+      image: mcr.microsoft.com/playwright:latest   # prebuilt Playwright + Chromium + git
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Prepare branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin ${{ inputs.branch_name }}; then
+            git checkout ${{ inputs.branch_name }}
+            git pull origin ${{ inputs.branch_name }}
+          else
+            git checkout --orphan ${{ inputs.branch_name }}
+            git rm -rf . || true
+            git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
+            git push --set-upstream origin ${{ inputs.branch_name }}
+          fi
+
+      - name: Run Playwright script to get second email
+        run: |
+          cat > /tmp/get-inbox.js << 'SCRIPT'
+          const { chromium } = require('playwright');
+
+          (async () => {
+            const browser = await chromium.launch();
+            const context = await browser.newContext({ ignoreHTTPSErrors: true });
+            const page = await context.newPage();
+
+            // 1. Open Guerrilla Mail
+            await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
+
+            // 2. Wait for the email address to appear and read it
+            await page.waitForSelector('#email-widget', { timeout: 10000 }); // the text field containing the address
+            let email = await page.$eval('#email-widget', el => el.value.trim());
+            console.log('==============================================');
+            console.log('  TEMP EMAIL:', email);
+            console.log('==============================================');
+            console.log('Waiting for TWO emails (only the 2nd will be saved)...');
+
+            // 3. Wait until at least 2 emails appear in the inbox
+            //    Guerrilla Mail adds rows with class "mail_row" (or "email" class on <tr>)
+            //    We'll use a function that counts visible rows.
+            await page.waitForFunction(() => {
+              const rows = document.querySelectorAll('tr.mail_row');
+              return rows.length >= 2;
+            }, { timeout: 0, polling: 5000 }); // 0 timeout means wait forever (until we cancel)
+
+            console.log('✅ Two emails received! Opening the second one...');
+
+            // 4. Click on the SECOND email row (index 1)
+            const rows = await page.$$('tr.mail_row');
+            await rows[1].click();
+
+            // 5. Wait for the email body to load
+            await page.waitForSelector('.email_body', { timeout: 10000 });
+
+            // 6. Extract the email content and all links
+            const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
+            const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => '(no subject)');
+            const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
+            const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
+
+            // 7. Save to a file
+            const fs = require('fs');
+            fs.mkdirSync('inbox', { recursive: true });
+            const now = new Date().toISOString().replace(/[:.]/g, '-');
+            const outPath = `inbox/${now}-second-email.txt`;
+            const content = [
+              `From: ${mailFrom}`,
+              `Subject: ${mailSubject}`,
+              `Date: ${new Date().toString()}`,
+              '',
+              'HTML BODY:',
+              '--------------------------------------------------',
+              bodyHTML,
+              '',
+              'ALL LINKS FOUND:',
+              ...allLinks.map(l => `  • ${l}`),
+              ''
+            ].join('\n');
+
+            fs.writeFileSync(outPath, content, 'utf-8');
+            console.log(`Email saved to ${outPath}`);
+            console.log('All links:');
+            allLinks.forEach(l => console.log('  ', l));
+
+            await browser.close();
+          })();
+          SCRIPT
+
+          node /tmp/get-inbox.js
+
+      - name: Commit and push email
+        if: always()
+        run: |
+          if [ -d "inbox" ] && [ "$(ls -A inbox 2>/dev/null)" ]; then
+            git add inbox/
+            git commit -m "[bot] Second email on branch ${{ inputs.branch_name }}"
+            git push origin ${{ inputs.branch_name }}
+          else
+            echo "No email files to commit."
+          fi
