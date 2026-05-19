@@ -80,12 +80,51 @@ jobs:
               email = match ? match[0] : 'UNKNOWN';
             }
 
+            // ---- Extract sid_token from page (multiple methods) ----
+            let sidToken = await page.evaluate(() => {
+              // Method 1: global guerrilla object
+              if (typeof guerrilla !== 'undefined' && guerrilla.sid_token) {
+                return guerrilla.sid_token;
+              }
+              // Method 2: check localStorage (unlikely but possible)
+              if (localStorage.getItem('sid_token')) {
+                return localStorage.getItem('sid_token');
+              }
+              return null;
+            });
+
+            if (!sidToken) {
+              // Method 3: scrape all script tags for sid_token assignment
+              sidToken = await page.evaluate(() => {
+                const scripts = document.querySelectorAll('script');
+                for (let s of scripts) {
+                  const text = s.textContent || s.innerText || '';
+                  const match = text.match(/sid_token\s*[:=]\s*['"]([^'"]+)['"]/);
+                  if (match) return match[1];
+                }
+                return null;
+              });
+            }
+
+            if (!sidToken) {
+              // Method 4: last resort – search whole HTML for patterns
+              const html = await page.content();
+              const match = html.match(/sid_token[=:]\s*['"]([^'"]+)['"]/);
+              if (match) sidToken = match[1];
+            }
+
+            if (!sidToken) {
+              console.error('❌ Could not extract sid_token from page. Aborting.');
+              process.exit(1);
+            }
+
             console.log('==============================================');
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
             console.log('Waiting for THREE emails (ignoring the welcome email)...');
             console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
+            const apiBase = 'https://www.guerrillamail.com/ajax.php';
             const start = Date.now();
             let emailSaved = false;
 
@@ -99,11 +138,24 @@ jobs:
                 break;
               }
 
-              // Fetch emails using the browser's session (no sid_token needed)
-              const listResponse = await page.evaluate(async () => {
-                const resp = await fetch('/ajax.php?f=fetch_email', { mode: 'cors', credentials: 'include' });
-                return resp.json();
-              });
+              // Fetch email list using sid_token
+              let listResponse;
+              try {
+                listResponse = await page.evaluate(async (token) => {
+                  const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { mode: 'cors', credentials: 'include' });
+                  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                  const text = await resp.text();
+                  try {
+                    return JSON.parse(text);
+                  } catch (e) {
+                    throw new Error('Invalid JSON: ' + text.substring(0, 200));
+                  }
+                }, sidToken);
+              } catch (err) {
+                console.log(`⚠️ API error: ${err.message}. Retrying...`);
+                await page.waitForTimeout(10000);
+                continue;
+              }
 
               const emailList = listResponse.list || [];
               const count = emailList.length;
@@ -111,13 +163,25 @@ jobs:
 
               if (count >= 3) {
                 console.log('✅ Three emails received! Fetching the third one...');
-                const thirdEmail = emailList[2]; // index 2 is the third email (your second Cloudflare email)
+                const thirdEmail = emailList[2]; // index 2 = third email
 
-                // Fetch the full content of the third email
-                const fullEmail = await page.evaluate(async (mailId) => {
-                  const resp = await fetch('/ajax.php?f=fetch_email&id=' + mailId, { mode: 'cors', credentials: 'include' });
-                  return resp.json();
-                }, thirdEmail.mail_id);
+                // Fetch full email
+                let fullEmail;
+                try {
+                  fullEmail = await page.evaluate(async (token, mailId) => {
+                    const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}&id=${mailId}`, { mode: 'cors', credentials: 'include' });
+                    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+                    const text = await resp.text();
+                    try {
+                      return JSON.parse(text);
+                    } catch (e) {
+                      throw new Error('Invalid JSON: ' + text.substring(0, 200));
+                    }
+                  }, sidToken, thirdEmail.mail_id);
+                } catch (err) {
+                  console.error(`Failed to fetch email content: ${err.message}`);
+                  break;
+                }
 
                 const mailFrom = thirdEmail.mail_from || 'unknown';
                 const mailSubject = thirdEmail.mail_subject || '(no subject)';
@@ -157,7 +221,6 @@ jobs:
                 break;
               }
 
-              // Wait 10 seconds before next check
               await page.waitForTimeout(10000);
             }
 
