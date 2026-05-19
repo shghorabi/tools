@@ -64,7 +64,7 @@ jobs:
 
             await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
 
-            // ---- Get the temporary email address and SID token ----
+            // ---- Get the temporary email address ----
             let email = '';
             try {
               await page.waitForSelector('#email-widget', { timeout: 10000 });
@@ -80,62 +80,44 @@ jobs:
               email = match ? match[0] : 'UNKNOWN';
             }
 
-            // Extract the sid_token (used for API calls) from the page's global JS
-            const sidToken = await page.evaluate(() => {
-              // Guerrilla Mail stores it in a global variable or data attribute
-              if (window.guerrilla && window.guerrilla.sid_token) return window.guerrilla.sid_token;
-              const scripts = document.querySelectorAll('script');
-              for (let s of scripts) {
-                const m = s.textContent.match(/sid_token\s*=\s*['"]([^'"]+)['"]/);
-                if (m) return m[1];
-              }
-              return null;
-            });
-
-            if (!sidToken) {
-              console.error('Could not extract sid_token from page – aborting.');
-              process.exit(1);
-            }
-
             console.log('==============================================');
             console.log('  TEMP EMAIL:', email);
             console.log('==============================================');
             console.log('Waiting for THREE emails (ignoring the welcome email)...');
             console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
-            const apiBase = 'https://www.guerrillamail.com/ajax.php';
             const start = Date.now();
             let emailSaved = false;
 
             while (true) {
               const elapsed = (Date.now() - start) / 1000;
               if (elapsed >= TIMEOUT_SECONDS) {
-                console.log('❌ Timeout: only found fewer than 3 emails.');
+                console.log('❌ Timeout: fewer than 3 emails.');
                 const fs = require('fs');
                 fs.mkdirSync('inbox', { recursive: true });
                 fs.writeFileSync('inbox/timeout.txt', 'Timed out waiting for third email.', 'utf-8');
                 break;
               }
 
-              // Fetch the list of emails via the API (browser makes the request)
-              const listResponse = await page.evaluate(async (token) => {
-                const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { mode: 'cors' });
+              // Fetch emails using the browser's session (no sid_token needed)
+              const listResponse = await page.evaluate(async () => {
+                const resp = await fetch('/ajax.php?f=fetch_email', { mode: 'cors', credentials: 'include' });
                 return resp.json();
-              }, sidToken);
+              });
 
               const emailList = listResponse.list || [];
               const count = emailList.length;
               console.log(`Checked at ${Math.round(elapsed)}s – ${count} email(s) found.`);
 
               if (count >= 3) {
-                console.log('✅ Three emails received! Fetching the third email...');
+                console.log('✅ Three emails received! Fetching the third one...');
                 const thirdEmail = emailList[2]; // index 2 is the third email (your second Cloudflare email)
 
                 // Fetch the full content of the third email
-                const fullEmail = await page.evaluate(async (token, mailId) => {
-                  const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}&id=${mailId}`, { mode: 'cors' });
+                const fullEmail = await page.evaluate(async (mailId) => {
+                  const resp = await fetch('/ajax.php?f=fetch_email&id=' + mailId, { mode: 'cors', credentials: 'include' });
                   return resp.json();
-                }, sidToken, thirdEmail.mail_id);
+                }, thirdEmail.mail_id);
 
                 const mailFrom = thirdEmail.mail_from || 'unknown';
                 const mailSubject = thirdEmail.mail_subject || '(no subject)';
