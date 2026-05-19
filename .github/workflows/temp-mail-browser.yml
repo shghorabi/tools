@@ -68,13 +68,8 @@ jobs:
             let email = '';
             try {
               await page.waitForSelector('#email-widget', { timeout: 10000 });
-              email = await page.$eval('#email-widget', el => {
-                return (el.value || el.textContent || '').trim();
-              });
+              email = await page.$eval('#email-widget', el => (el.value || el.textContent || '').trim());
             } catch (e) {
-              console.log('Primary email selector failed, trying fallback...');
-            }
-            if (!email || !email.includes('@')) {
               const bodyText = await page.evaluate(() => document.body.innerText);
               const match = bodyText.match(/[\w.-]+@[\w.-]+\.\w+/);
               email = match ? match[0] : 'UNKNOWN';
@@ -85,56 +80,61 @@ jobs:
             console.log('Waiting for THREE emails (ignoring the welcome email)...');
             console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
-            // ---- Attempt token capture (optional, we'll fallback to UI) ----
+            // Try capturing sid_token for a quick API attempt
             let sidToken = null;
-            // Method: listen for network requests
-            page.on('request', request => {
-              const url = request.url();
+            page.on('request', req => {
+              const url = req.url();
               if (url.includes('/ajax.php') && url.includes('sid_token=')) {
-                const match = url.match(/sid_token=([^&]+)/);
-                if (match && !sidToken) {
-                  sidToken = match[1];
-                  console.log('🔑 Captured sid_token from network');
-                }
+                const m = url.match(/sid_token=([^&]+)/);
+                if (m && !sidToken) sidToken = m[1];
               }
             });
-            // Also try scraping scripts after a short delay
             await page.waitForTimeout(2000);
-            if (!sidToken) {
-              sidToken = await page.evaluate(() => {
-                const scripts = document.querySelectorAll('script');
-                for (let s of scripts) {
-                  const text = s.textContent || s.innerText || '';
-                  const m = text.match(/sid_token['"]?\s*[:=]\s*['"]([^'"]+)['"]/);
-                  if (m) return m[1];
+
+            // Quick API test – if it works, use it; otherwise go to UI
+            let useUI = true;
+            if (sidToken) {
+              try {
+                const test = await page.evaluate(async (token) => {
+                  const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { credentials: 'include' });
+                  return resp.json();
+                }, sidToken);
+                if (test && test.list) {
+                  console.log('API working – using it for polling.');
+                  useUI = false;
                 }
-                return null;
-              });
-            }
-            // Last chance: search all HTML
-            if (!sidToken) {
-              const html = await page.content();
-              const m = html.match(/sid_token[=:]\s*['"]([^'"]+)['"]/);
-              if (m) sidToken = m[1];
+              } catch (e) {
+                console.log('API unavailable, falling back to UI polling.');
+              }
+            } else {
+              console.log('No token, using UI polling.');
             }
 
-            if (sidToken) {
-              console.log('Using API-based polling with captured token...');
-              // ---- API POLLING (same as before) ----
-              const start = Date.now();
-              let saved = false;
-              while (!saved) {
-                const elapsed = (Date.now() - start) / 1000;
-                if (elapsed >= TIMEOUT_SECONDS) { console.log('Timeout'); break; }
+            const start = Date.now();
+            let saved = false;
+
+            // POLLING LOOP
+            while (!saved) {
+              const elapsed = (Date.now() - start) / 1000;
+              if (elapsed >= TIMEOUT_SECONDS) {
+                console.log('❌ Timeout');
+                const fs = require('fs');
+                fs.mkdirSync('inbox', { recursive: true });
+                fs.writeFileSync('inbox/timeout.txt', 'Timed out waiting for third email.', 'utf-8');
+                break;
+              }
+
+              let rowCount = 0;
+              if (!useUI) {
+                // API polling
                 try {
                   const list = await page.evaluate(async (token) => {
                     const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { credentials: 'include' });
                     return resp.json();
                   }, sidToken);
-                  const emails = list.list || [];
-                  console.log(`Checked at ${Math.round(elapsed)}s – ${emails.length} email(s)`);
-                  if (emails.length >= 3) {
-                    const third = emails[2];
+                  rowCount = (list.list || []).length;
+                  if (rowCount >= 3) {
+                    const third = list.list[2];
                     const full = await page.evaluate(async (token, mailId) => {
                       const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}&id=${mailId}`, { credentials: 'include' });
                       return resp.json();
@@ -144,87 +144,65 @@ jobs:
                     break;
                   }
                 } catch (e) {
-                  console.log(`API error: ${e.message}`);
+                  console.log(`API error, switching to UI…`);
+                  useUI = true; // fallback on next loop
                 }
-                await page.waitForTimeout(10000);
-              }
-              if (saved) {
-                await browser.close();
-                return;
-              }
-              console.log('API polling failed, falling back to UI clicking...');
-            } else {
-              console.log('No token captured, using UI-based clicking...');
-            }
-
-            // ---- UI FALLBACK: wait for rows, click third, verify subject ----
-            const start = Date.now();
-            while (true) {
-              const elapsed = (Date.now() - start) / 1000;
-              if (elapsed >= TIMEOUT_SECONDS) {
-                console.log('Timeout');
-                break;
               }
 
-              const rows = await page.$$('tr.mail_row');
-              const count = rows.length;
-              console.log(`UI check at ${Math.round(elapsed)}s – ${count} email(s)`);
+              if (useUI) {
+                // UI polling
+                const rows = await page.$$('tr.mail_row');
+                rowCount = rows.length;
+                console.log(`UI check at ${Math.round(elapsed)}s – ${rowCount} email(s)`);
 
-              if (count >= 3) {
-                // Get subject of the third row (index 2) to verify later
-                const thirdSubject = await rows[2].$eval('.td3', el => el.textContent.trim()).catch(() => '');
-                console.log(`Third email subject: "${thirdSubject}"`);
+                if (rowCount >= 3) {
+                  // Get subject of third row for verification
+                  const thirdSubject = await rows[2].$eval('.td3', el => el.textContent.trim()).catch(() => '');
+                  console.log(`Third email subject: "${thirdSubject}"`);
 
-                // Click the third row
-                await rows[2].click();
+                  // Click third row
+                  await rows[2].click();
+                  // Wait for body to contain this subject (max 10s)
+                  try {
+                    await page.waitForFunction(
+                      (expectedSubject) => {
+                        const body = document.querySelector('.email_body');
+                        return body && (body.innerText.includes(expectedSubject) || body.innerHTML.includes(expectedSubject));
+                      },
+                      thirdSubject,
+                      { timeout: 10000 }
+                    );
+                  } catch (e) {
+                    console.log('Body did not update, saving whatever is displayed…');
+                  }
 
-                // Wait for the email body to change to something containing this subject
-                // (or just wait for the body to update and then verify)
-                try {
-                  await page.waitForFunction(
-                    (expectedSubject) => {
-                      const body = document.querySelector('.email_body');
-                      if (!body) return false;
-                      // Check if the body text or HTML contains the subject
-                      return body.innerText.includes(expectedSubject) || body.innerHTML.includes(expectedSubject);
-                    },
-                    thirdSubject,
-                    { timeout: 15000 }
-                  );
-                } catch (e) {
-                  console.log('Timed out waiting for body to match subject, continuing anyway...');
+                  // Extract content
+                  const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => '');
+                  const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => thirdSubject);
+                  const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
+                  const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
+
+                  saveEmail({ mail_from: mailFrom, mail_subject: mailSubject }, { mail_html: bodyHTML }, allLinks);
+                  saved = true;
+                  break;
                 }
-
-                // Now extract the email body
-                const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
-                const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => thirdSubject);
-                const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
-                const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
-
-                saveEmail({
-                  mail_from: mailFrom,
-                  mail_subject: mailSubject,
-                }, { mail_html: bodyHTML, mail_body: '' }, allLinks);
-                await browser.close();
-                return;
               }
 
               await page.waitForTimeout(10000);
             }
 
             await browser.close();
-            process.exit(1);
+            if (!saved) process.exit(1);
 
-            // Helper to save email
             function saveEmail(meta, full, links = null) {
               const fs = require('fs');
               fs.mkdirSync('inbox', { recursive: true });
               const now = new Date().toISOString().replace(/[:.]/g, '-');
               const outPath = `inbox/${now}-second-cloudflare-email.txt`;
               const bodyHTML = full.mail_html || '';
-              const linkRegex = /href="([^"]+)"/g;
               const allLinks = links || [];
               if (!links) {
+                const linkRegex = /href="([^"]+)"/g;
                 let m;
                 while ((m = linkRegex.exec(bodyHTML)) !== null) allLinks.push(m[1]);
               }
@@ -251,7 +229,7 @@ jobs:
 
           export TIMEOUT_SECONDS=$(( ${{ inputs.timeout_minutes }} * 60 ))
           node ./get-inbox.js
-          
+         
       - name: Commit and push email
         if: always()
         run: |
