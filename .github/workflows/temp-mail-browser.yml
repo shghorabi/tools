@@ -27,8 +27,12 @@ jobs:
           persist-credentials: true
           fetch-depth: 0
 
-      - name: Install Playwright & system dependencies
+      - name: Install Playwright & browser
         run: |
+          # Initialize a Node project and install playwright locally
+          npm init -y
+          npm install playwright
+          # Install system dependencies required by Chromium
           npx playwright install-deps chromium
           npx playwright install chromium
 
