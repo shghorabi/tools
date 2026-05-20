@@ -1,0 +1,152 @@
+name: Temp Email (Mail.tm API)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name'
+        required: true
+        default: 'temp-mail-mailtm'
+        type: string
+      timeout_minutes:
+        description: 'Max wait (minutes)'
+        required: false
+        default: '15'
+        type: string
+
+jobs:
+  temp-mail:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Prepare branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+          if git ls-remote --exit-code --heads origin ${{ inputs.branch_name }}; then
+            git checkout ${{ inputs.branch_name }}
+            git pull origin ${{ inputs.branch_name }}
+          else
+            git checkout --orphan ${{ inputs.branch_name }}
+            git rm -rf . || true
+            git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
+            git push --set-upstream origin ${{ inputs.branch_name }}
+          fi
+
+      - name: Get inbox via Mail.tm and wait for second email
+        id: inbox
+        run: |
+          # 1. Create an account with a random password
+          PASSWORD=$(openssl rand -hex 12)
+          CREATE_RESPONSE=$(curl -s -X POST "https://api.mail.tm/accounts" \
+            -H "Content-Type: application/json" \
+            -d "{\"address\":\"\",\"password\":\"$PASSWORD\"}")
+          EMAIL=$(echo "$CREATE_RESPONSE" | jq -r '.address')
+          ACCOUNT_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+
+          if [ -z "$EMAIL" ] || [ "$EMAIL" = "null" ]; then
+            echo "Failed to create Mail.tm account. Response:"
+            echo "$CREATE_RESPONSE" | jq .
+            exit 1
+          fi
+
+          # 2. Get a JWT token
+          TOKEN_RESPONSE=$(curl -s -X POST "https://api.mail.tm/token" \
+            -H "Content-Type: application/json" \
+            -d "{\"address\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")
+          TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.token')
+
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "Failed to obtain token. Response:"
+            echo "$TOKEN_RESPONSE" | jq .
+            exit 1
+          fi
+
+          echo ""
+          echo "=============================================="
+          echo "  TEMP EMAIL: $EMAIL"
+          echo "=============================================="
+          echo "Waiting for TWO emails (the second one will be saved)..."
+          echo "(Will wait up to ${{ inputs.timeout_minutes }} minutes)"
+
+          TIMEOUT_SECONDS=$(( ${{ inputs.timeout_minutes }} * 60 ))
+          START_TIME=$(date +%s)
+
+          while true; do
+            sleep 10
+
+            # Fetch all messages
+            MESSAGES_RESPONSE=$(curl -s "https://api.mail.tm/messages" \
+              -H "Authorization: Bearer $TOKEN")
+            COUNT=$(echo "$MESSAGES_RESPONSE" | jq '.["hydra:member"] | length')
+
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_TIME))
+
+            if [ "$COUNT" -ge 2 ]; then
+              echo "✅ Received $COUNT emails. Fetching the second one..."
+              SECOND_ID=$(echo "$MESSAGES_RESPONSE" | jq -r '.["hydra:member"][1].id')
+
+              # Fetch the full second email
+              EMAIL_DETAIL=$(curl -s "https://api.mail.tm/messages/$SECOND_ID" \
+                -H "Authorization: Bearer $TOKEN")
+              FROM=$(echo "$EMAIL_DETAIL" | jq -r '.from.address')
+              SUBJECT=$(echo "$EMAIL_DETAIL" | jq -r '.subject')
+              HTML_BODY=$(echo "$EMAIL_DETAIL" | jq -r '.html // ""')
+              TEXT_BODY=$(echo "$EMAIL_DETAIL" | jq -r '.text // ""')
+
+              # Extract all http/https links from HTML
+              LINKS=$(echo "$HTML_BODY" | grep -oP 'href="\K[^"]+' | grep -E '^https?://' || echo "No links found")
+
+              mkdir -p inbox
+              OUTFILE="inbox/$(date +%Y%m%d-%H%M%S)-second-email.txt"
+              {
+                echo "From: $FROM"
+                echo "Subject: $SUBJECT"
+                echo "Date: $(date)"
+                echo "--------------------------------------------------"
+                echo "PLAIN TEXT BODY:"
+                echo "$TEXT_BODY"
+                echo ""
+                echo "HTML BODY:"
+                echo "$HTML_BODY"
+                echo ""
+                echo "ALL LINKS FOUND:"
+                echo "$LINKS"
+              } > "$OUTFILE"
+
+              echo "Email saved to $OUTFILE"
+              echo "All links:"
+              echo "$LINKS"
+              exit 0
+            fi
+
+            if [ $ELAPSED -ge $TIMEOUT_SECONDS ]; then
+              echo "Timeout: Only $COUNT email(s) received."
+              mkdir -p inbox
+              echo "Timed out waiting for second email." > "inbox/$(date +%Y%m%d-%H%M%S)-timeout.txt"
+              exit 1
+            fi
+
+            echo "Checked at ${ELAPSED}s – $COUNT email(s) found."
+          done
+
+      - name: Commit and push email
+        if: always()
+        run: |
+          if [ -d "inbox" ] && [ "$(ls -A inbox 2>/dev/null)" ]; then
+            git add inbox/
+            git commit -m "[bot] Second email (Mail.tm) on branch ${{ inputs.branch_name }}"
+            git push origin ${{ inputs.branch_name }}
+          else
+            echo "No email files to commit."
+          fi
