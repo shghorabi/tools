@@ -45,13 +45,27 @@ jobs:
       - name: Get inbox via Mail.tm and wait for second email
         id: inbox
         run: |
-          # 1. Create an account with a random password
+          # 1. Fetch available domains
+          DOMAINS_RESPONSE=$(curl -s --max-time 10 "https://api.mail.tm/domains")
+          DOMAIN=$(echo "$DOMAINS_RESPONSE" | jq -r '.["hydra:member"][0].domain')
+          if [ -z "$DOMAIN" ] || [ "$DOMAIN" = "null" ]; then
+            echo "Failed to fetch domains. Response:"
+            echo "$DOMAINS_RESPONSE" | jq .
+            exit 1
+          fi
+          echo "Using domain: $DOMAIN"
+
+          # 2. Generate random username and password
+          USERNAME=$(openssl rand -hex 8)
           PASSWORD=$(openssl rand -hex 12)
-          CREATE_RESPONSE=$(curl -s -X POST "https://api.mail.tm/accounts" \
+          ADDRESS="${USERNAME}@${DOMAIN}"
+
+          # 3. Create the account
+          CREATE_RESPONSE=$(curl -s --max-time 10 -X POST "https://api.mail.tm/accounts" \
             -H "Content-Type: application/json" \
-            -d "{\"address\":\"\",\"password\":\"$PASSWORD\"}")
-          EMAIL=$(echo "$CREATE_RESPONSE" | jq -r '.address')
+            -d "{\"address\":\"$ADDRESS\",\"password\":\"$PASSWORD\"}")
           ACCOUNT_ID=$(echo "$CREATE_RESPONSE" | jq -r '.id')
+          EMAIL=$(echo "$CREATE_RESPONSE" | jq -r '.address')
 
           if [ -z "$EMAIL" ] || [ "$EMAIL" = "null" ]; then
             echo "Failed to create Mail.tm account. Response:"
@@ -59,8 +73,8 @@ jobs:
             exit 1
           fi
 
-          # 2. Get a JWT token
-          TOKEN_RESPONSE=$(curl -s -X POST "https://api.mail.tm/token" \
+          # 4. Get JWT token
+          TOKEN_RESPONSE=$(curl -s --max-time 10 -X POST "https://api.mail.tm/token" \
             -H "Content-Type: application/json" \
             -d "{\"address\":\"$EMAIL\",\"password\":\"$PASSWORD\"}")
           TOKEN=$(echo "$TOKEN_RESPONSE" | jq -r '.token')
@@ -84,8 +98,7 @@ jobs:
           while true; do
             sleep 10
 
-            # Fetch all messages
-            MESSAGES_RESPONSE=$(curl -s "https://api.mail.tm/messages" \
+            MESSAGES_RESPONSE=$(curl -s --max-time 10 "https://api.mail.tm/messages" \
               -H "Authorization: Bearer $TOKEN")
             COUNT=$(echo "$MESSAGES_RESPONSE" | jq '.["hydra:member"] | length')
 
@@ -96,8 +109,7 @@ jobs:
               echo "✅ Received $COUNT emails. Fetching the second one..."
               SECOND_ID=$(echo "$MESSAGES_RESPONSE" | jq -r '.["hydra:member"][1].id')
 
-              # Fetch the full second email
-              EMAIL_DETAIL=$(curl -s "https://api.mail.tm/messages/$SECOND_ID" \
+              EMAIL_DETAIL=$(curl -s --max-time 10 "https://api.mail.tm/messages/$SECOND_ID" \
                 -H "Authorization: Bearer $TOKEN")
               FROM=$(echo "$EMAIL_DETAIL" | jq -r '.from.address')
               SUBJECT=$(echo "$EMAIL_DETAIL" | jq -r '.subject')
