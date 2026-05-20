@@ -49,7 +49,6 @@ jobs:
             git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
             git push --set-upstream origin ${{ inputs.branch_name }}
           fi
-          
       - name: Run Playwright script to get second email
         run: |
           cat > ./get-inbox.js << 'SCRIPT'
@@ -80,40 +79,9 @@ jobs:
             console.log('Waiting for THREE emails (ignoring the welcome email)...');
             console.log('(Will wait up to ' + (TIMEOUT_SECONDS/60) + ' minutes)');
 
-            // Try capturing sid_token for a quick API attempt
-            let sidToken = null;
-            page.on('request', req => {
-              const url = req.url();
-              if (url.includes('/ajax.php') && url.includes('sid_token=')) {
-                const m = url.match(/sid_token=([^&]+)/);
-                if (m && !sidToken) sidToken = m[1];
-              }
-            });
-            await page.waitForTimeout(2000);
-
-            // Quick API test – if it works, use it; otherwise go to UI
-            let useUI = true;
-            if (sidToken) {
-              try {
-                const test = await page.evaluate(async (token) => {
-                  const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { credentials: 'include' });
-                  return resp.json();
-                }, sidToken);
-                if (test && test.list) {
-                  console.log('API working – using it for polling.');
-                  useUI = false;
-                }
-              } catch (e) {
-                console.log('API unavailable, falling back to UI polling.');
-              }
-            } else {
-              console.log('No token, using UI polling.');
-            }
-
             const start = Date.now();
             let saved = false;
 
-            // POLLING LOOP
             while (!saved) {
               const elapsed = (Date.now() - start) / 1000;
               if (elapsed >= TIMEOUT_SECONDS) {
@@ -124,68 +92,84 @@ jobs:
                 break;
               }
 
-              let rowCount = 0;
-              if (!useUI) {
-                // API polling
+              // UI polling
+              const rows = await page.$$('tr.mail_row');
+              const count = rows.length;
+              console.log(`UI check at ${Math.round(elapsed)}s – ${count} email(s)`);
+
+              if (count >= 3) {
+                // We'll try to load the third email.
+                // First, check if the third row has a data attribute with mail_id
+                const mailId = await rows[2].$eval('[data-mail-id]', el => el.dataset.mailId).catch(() => null) ||
+                               await rows[2].evaluate(el => el.getAttribute('data-mail-id') || el.getAttribute('data-id')).catch(() => null);
+
+                console.log(`Third row mail_id: ${mailId || 'not found'}`);
+
+                // Click the third row
+                await rows[2].click();
+                console.log('Clicked third row, waiting for email body to update...');
+
+                // Wait until the welcome text is no longer visible, or a timeout
+                let loaded = false;
                 try {
-                  const list = await page.evaluate(async (token) => {
-                    const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}`, { credentials: 'include' });
-                    return resp.json();
-                  }, sidToken);
-                  rowCount = (list.list || []).length;
-                  if (rowCount >= 3) {
-                    const third = list.list[2];
-                    const full = await page.evaluate(async (token, mailId) => {
-                      const resp = await fetch(`/ajax.php?f=fetch_email&sid_token=${token}&id=${mailId}`, { credentials: 'include' });
-                      return resp.json();
-                    }, sidToken, third.mail_id);
-                    saveEmail(third, full);
-                    saved = true;
-                    break;
-                  }
+                  await page.waitForFunction(() => {
+                    const body = document.querySelector('.email_body');
+                    return body && !body.innerText.includes('Dear Random User');
+                  }, { timeout: 8000 });
+                  loaded = true;
                 } catch (e) {
-                  console.log(`API error, switching to UI…`);
-                  useUI = true; // fallback on next loop
+                  console.log('Welcome text still present after click, attempting force reload...');
                 }
-              }
 
-              if (useUI) {
-                // UI polling
-                const rows = await page.$$('tr.mail_row');
-                rowCount = rows.length;
-                console.log(`UI check at ${Math.round(elapsed)}s – ${rowCount} email(s)`);
-
-                if (rowCount >= 3) {
-                  // Get subject of third row for verification
-                  const thirdSubject = await rows[2].$eval('.td3', el => el.textContent.trim()).catch(() => '');
-                  console.log(`Third email subject: "${thirdSubject}"`);
-
-                  // Click third row
-                  await rows[2].click();
-                  // Wait for body to contain this subject (max 10s)
-                  try {
-                    await page.waitForFunction(
-                      (expectedSubject) => {
-                        const body = document.querySelector('.email_body');
-                        return body && (body.innerText.includes(expectedSubject) || body.innerHTML.includes(expectedSubject));
-                      },
-                      thirdSubject,
-                      { timeout: 10000 }
-                    );
-                  } catch (e) {
-                    console.log('Body did not update, saving whatever is displayed…');
+                if (!loaded) {
+                  // Force reload: navigate to the inbox base, wait, then re-click
+                  await page.goto('https://www.guerrillamail.com/', { waitUntil: 'networkidle' });
+                  await page.waitForTimeout(2000);
+                  // Re-fetch rows and click the third again
+                  const newRows = await page.$$('tr.mail_row');
+                  if (newRows.length >= 3) {
+                    await newRows[2].click();
+                    await page.waitForFunction(() => {
+                      const body = document.querySelector('.email_body');
+                      return body && !body.innerText.includes('Dear Random User');
+                    }, { timeout: 10000 }).catch(() => {});
                   }
-
-                  // Extract content
-                  const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => '');
-                  const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => thirdSubject);
-                  const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
-                  const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
-
-                  saveEmail({ mail_from: mailFrom, mail_subject: mailSubject }, { mail_html: bodyHTML }, allLinks);
-                  saved = true;
-                  break;
                 }
+
+                // Now extract the email body
+                const mailFrom = await page.$eval('.email_from', el => el.textContent.trim()).catch(() => 'unknown');
+                const mailSubject = await page.$eval('.email_subject', el => el.textContent.trim()).catch(() => '(no subject)');
+                const bodyHTML = await page.$eval('.email_body', el => el.innerHTML).catch(() => '');
+                const allLinks = await page.$$eval('.email_body a', links => links.map(a => a.href));
+
+                // Final sanity check: if the body still contains welcome text, warn but save anyway
+                if (bodyHTML.includes('Dear Random User')) {
+                  console.log('WARNING: Still showing welcome email – saving anyway, but check the file.');
+                }
+
+                const fs = require('fs');
+                fs.mkdirSync('inbox', { recursive: true });
+                const now = new Date().toISOString().replace(/[:.]/g, '-');
+                const outPath = `inbox/${now}-second-cloudflare-email.txt`;
+                const content = [
+                  `From: ${mailFrom}`,
+                  `Subject: ${mailSubject}`,
+                  `Date: ${new Date().toString()}`,
+                  '',
+                  'HTML BODY:',
+                  '--------------------------------------------------',
+                  bodyHTML,
+                  '',
+                  'ALL LINKS FOUND:',
+                  ...allLinks.map(l => `  • ${l}`),
+                  ''
+                ].join('\n');
+                fs.writeFileSync(outPath, content, 'utf-8');
+                console.log(`Email saved to ${outPath}`);
+                console.log('All links:');
+                allLinks.forEach(l => console.log('  ', l));
+                saved = true;
+                break;
               }
 
               await page.waitForTimeout(10000);
@@ -193,42 +177,11 @@ jobs:
 
             await browser.close();
             if (!saved) process.exit(1);
-
-            function saveEmail(meta, full, links = null) {
-              const fs = require('fs');
-              fs.mkdirSync('inbox', { recursive: true });
-              const now = new Date().toISOString().replace(/[:.]/g, '-');
-              const outPath = `inbox/${now}-second-cloudflare-email.txt`;
-              const bodyHTML = full.mail_html || '';
-              const allLinks = links || [];
-              if (!links) {
-                const linkRegex = /href="([^"]+)"/g;
-                let m;
-                while ((m = linkRegex.exec(bodyHTML)) !== null) allLinks.push(m[1]);
-              }
-              const content = [
-                `From: ${meta.mail_from || 'unknown'}`,
-                `Subject: ${meta.mail_subject || '(no subject)'}`,
-                `Date: ${new Date().toString()}`,
-                '',
-                'HTML BODY:',
-                '--------------------------------------------------',
-                bodyHTML,
-                '',
-                'ALL LINKS FOUND:',
-                ...allLinks.map(l => `  • ${l}`),
-                ''
-              ].join('\n');
-              fs.writeFileSync(outPath, content, 'utf-8');
-              console.log(`Email saved to ${outPath}`);
-              console.log('All links:');
-              allLinks.forEach(l => console.log('  ', l));
-            }
           })();
           SCRIPT
 
           export TIMEOUT_SECONDS=$(( ${{ inputs.timeout_minutes }} * 60 ))
-          node ./get-inbox.js
+          node ./get-inbox.js          
          
       - name: Commit and push email
         if: always()
