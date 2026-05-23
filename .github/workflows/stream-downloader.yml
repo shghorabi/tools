@@ -1,0 +1,172 @@
+name: Stream Downloader (FFmpeg)
+
+on:
+  workflow_dispatch:
+    inputs:
+      link:
+        description: '🎞️ M3U8 / Stream URL'
+        required: true
+        type: string
+      use_warp:
+        description: '🛡️ Use WARP (helps with geo‑restrictions)'
+        required: true
+        default: false
+        type: boolean
+      parts_size:
+        description: '🗜️ Parts size (MB)'
+        required: false
+        type: string
+        default: '45'
+      branch_name:
+        description: '🌿 Branch name (use unique name for each run)'
+        required: true
+        default: 'stream'
+        type: string
+      custom_headers:
+        description: '🔑 Extra FFmpeg headers (e.g., Referer: https://example.com)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  download-and-release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 0
+
+      - name: Prepare branch
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+          git fetch origin
+
+          if git ls-remote --exit-code --heads origin ${{ inputs.branch_name }}; then
+            git checkout ${{ inputs.branch_name }}
+            git pull origin ${{ inputs.branch_name }}
+          else
+            git checkout --orphan ${{ inputs.branch_name }}
+            git rm -rf . || true
+            mkdir -p ${{ inputs.branch_name }}
+            git commit --allow-empty -m "[bot] Initialize ${{ inputs.branch_name }} branch"
+            git push --set-upstream origin ${{ inputs.branch_name }}
+          fi
+
+      - name: Setup WARP (optional)
+        if: ${{ inputs.use_warp }}
+        run: |
+          docker rm -f warp 2>/dev/null || true
+          docker network create warp-net 2>/dev/null || true
+          docker run -d \
+            --name warp \
+            --restart=always \
+            --network warp-net \
+            -p 1080:1080 \
+            --cap-add NET_ADMIN \
+            --sysctl net.ipv6.conf.all.disable_ipv6=0 \
+            --sysctl net.ipv4.conf.all.src_valid_mark=1 \
+            -v warp-data:/var/lib/cloudflare-warp \
+            caomingjun/warp
+
+          echo "Waiting for WARP to initialize..."
+          for i in {1..10}; do
+            RESULT=$(curl -s --max-time 3 --socks5-hostname 127.0.0.1:1080 https://1.1.1.1/cdn-cgi/trace 2>/dev/null || true)
+            if echo "$RESULT" | grep -qE "warp=(on|plus)"; then
+              echo "WARP ready!"
+              break
+            fi
+            sleep 3
+          done
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Download stream with FFmpeg
+        id: download
+        run: |
+          mkdir -p tmpstream
+          cd tmpstream
+
+          # Build the FFmpeg command
+          FFMPEG_CMD="ffmpeg -y -i \"${{ github.event.inputs.link }}\" -c copy"
+
+          # Add custom headers if provided
+          if [ -n "${{ inputs.custom_headers }}" ]; then
+            FFMPEG_CMD="$FFMPEG_CMD -headers \"${{ inputs.custom_headers }}\""
+          fi
+
+          # Set output file name (FFmpeg will auto-detect format)
+          FFMPEG_CMD="$FFMPEG_CMD output.mp4"
+
+          # If WARP is enabled, route traffic through proxy
+          if [ ${{ inputs.use_warp }} == 'true' ]; then
+            export http_proxy=socks5h://127.0.0.1:1080
+            export https_proxy=socks5h://127.0.0.1:1080
+          fi
+
+          echo "Running: $FFMPEG_CMD"
+          eval $FFMPEG_CMD
+
+          # Determine final output name (FFmpeg might create .mp4 or .ts, etc.)
+          FILE=$(ls -1 output.* 2>/dev/null || ls -1 | head -n 1)
+          SAFE_NAME=$(echo "$FILE" | tr ' ' '_')
+          echo "SAFE_NAME=$SAFE_NAME" >> $GITHUB_ENV
+
+          # Split into parts (same logic as your wget workflow)
+          mkdir -p ../stream
+          rm -rf tmpzip
+          mkdir tmpzip
+          zip -0 -s "${{ inputs.parts_size }}m" "tmpzip/${SAFE_NAME}.zip" "$FILE"
+          mv tmpzip/* ../stream/
+
+      - name: Stop WARP
+        if: ${{ inputs.use_warp }}
+        run: docker stop warp || true
+
+      - name: Generate README with links
+        run: |
+          rm -f README.md
+          echo "# 📥 Stream Download Links" > README.md
+          echo "Generated on: $(date)" >> README.md
+          echo "" >> README.md
+
+          for file in stream/*; do
+            if [ -f "$file" ]; then
+              filename=$(basename "$file")
+              encoded_filename=$(python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$filename")
+              url="https://github.com/${{ github.repository }}/raw/${{ inputs.branch_name }}/stream/$encoded_filename"
+              echo "- [Download $filename]($url)" >> README.md
+            fi
+          done
+
+      - name: Commit and push
+        env:
+          BATCH_SIZE: 5
+        run: |
+          if [ -f README.md ]; then
+            git add README.md
+            git commit -m "[bot] Add README with links" || echo "No changes to README"
+            git push
+          fi
+
+          cd stream
+          FILES=($(ls -1 | sort))
+          TOTAL=${#FILES[@]}
+          if [ $TOTAL -eq 0 ]; then
+            echo "No files to commit."
+            exit 0
+          fi
+
+          for ((i=0; i<$TOTAL; i+=$BATCH_SIZE)); do
+            BATCH=("${FILES[@]:i:$BATCH_SIZE}")
+            echo "Committing batch $((i/BATCH_SIZE + 1)): ${BATCH[*]}"
+            git add "${BATCH[@]}"
+            git commit -m "[bot] Add stream parts $((i+1)) to $((i+${#BATCH[@]})) for ${{ env.SAFE_NAME }}"
+            git push
+          done
